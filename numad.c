@@ -1679,6 +1679,28 @@ void process_hash_table_expand() {
 }
 
 
+static int process_hash_table_entries_used() {
+    int used = 0;
+    for (int ix = 0;  (ix < process_hash_table_size);  ix++) {
+        if (process_hash_table[ix].pid) {
+            used += 1;
+        }
+    }
+    return used;
+}
+
+
+static void process_hash_table_ensure_free_slots(int min_free_slots) {
+    if (min_free_slots < 1) {
+        min_free_slots = 1;
+    }
+    while ((process_hash_table_size <= 0)
+           || ((process_hash_table_size - process_hash_table_entries_used()) < min_free_slots)) {
+        process_hash_table_expand();
+    }
+}
+
+
 void process_hash_table_cleanup(uint64_t update_time) {
     int num_hash_entries_used = 0;
     for (int ix = 0;  (ix < process_hash_table_size);  ix++) {
@@ -2630,12 +2652,20 @@ int update_processes(uint64_t cycle_ts) {
     // update the statistics, time stamp and utilization numbers for the select
     // processes in the hash table.
     int new_candidates = 0;  // limit number of new candidates per update
+    int include_list_len = 0;
+    int scan_candidate_limit = 0;
     int files = 0;
 
     pthread_mutex_lock(&pid_list_mutex);
     for (pid_list_p pid_ptr = exclude_pid_list; pid_ptr != NULL; pid_ptr = pid_ptr->next) {
         process_hash_remove(pid_ptr->pid);
     }
+
+    for (pid_list_p count_ptr = include_pid_list; count_ptr != NULL; count_ptr = count_ptr->next) {
+        include_list_len += 1;
+    }
+    // Reserve space for explicit includes before we start inserting them.
+    process_hash_table_ensure_free_slots(include_list_len);
 
     pid_list_p pid_ptr = include_pid_list;
     while (pid_ptr != NULL) {
@@ -2658,6 +2688,18 @@ int update_processes(uint64_t cycle_ts) {
     pthread_mutex_unlock(&pid_list_mutex);
 
     if (scan_all_processes) {
+        scan_candidate_limit = process_hash_table_size / 3;
+        if (scan_candidate_limit < 1) {
+            scan_candidate_limit = 1;
+        }
+        // Enter the bulk /proc scan with enough free slots for this cycle's
+        // prospective new candidates instead of waiting for end-of-cycle cleanup.
+        process_hash_table_ensure_free_slots(scan_candidate_limit);
+        scan_candidate_limit = process_hash_table_size / 3;
+        if (scan_candidate_limit < 1) {
+            scan_candidate_limit = 1;
+        }
+
         struct dirent **namelist;
         files = scandir("/proc", &namelist, name_starts_with_digit, NULL);
         if (files < 0) {
@@ -2669,7 +2711,7 @@ int update_processes(uint64_t cycle_ts) {
             pthread_mutex_lock(&pid_list_mutex);
             int skip = pid_is_in_list(include_pid_list, pid) || pid_is_in_list(exclude_pid_list, pid);
             pthread_mutex_unlock(&pid_list_mutex);
-            if (!skip && (new_candidates < process_hash_table_size / 3)) {
+            if (!skip && (new_candidates < scan_candidate_limit)) {
                 process_data_t sample = {0};
                 if ((get_stat_data_for_pid(pid, &sample) == 0) && (sample.MBs_used > MEMORY_THRESHOLD)) {
                     sample.data_time_stamp = cycle_ts;
