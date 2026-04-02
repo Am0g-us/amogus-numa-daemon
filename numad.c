@@ -765,6 +765,7 @@ double stddev_node_MBs_free = 0.0;
 int *node_ix_by_id = NULL;
 int max_node_id_seen = -1;
 int *cpu_to_node_ix = NULL;
+int migrate_syscall_maxnode = 0;
 
 
 
@@ -902,6 +903,78 @@ static int read_int_file(const char *path, int *value) {
     }
     *value = (int)v;
     return 0;
+}
+
+
+static int round_up_bits_to_unsigned_long_boundary(int bits) {
+    int bits_in_long = (CHAR_BIT * (int)sizeof(unsigned long));
+    if (bits <= 0) {
+        return 0;
+    }
+    if (bits < bits_in_long) {
+        return bits_in_long;
+    }
+    int rem = bits % bits_in_long;
+    if (rem != 0) {
+        bits += (bits_in_long - rem);
+    }
+    return bits;
+}
+
+
+static int parse_hex_mask_width_bits(const char *s) {
+    if (s == NULL) {
+        return -1;
+    }
+    int hex_digits = 0;
+    for (; (*s != '\0') && (*s != '\n'); s++) {
+        if (isxdigit((unsigned char)*s)) {
+            hex_digits += 1;
+        }
+    }
+    return (hex_digits > 0) ? (hex_digits * 4) : -1;
+}
+
+
+static int detect_migrate_syscall_maxnode_from_status(void) {
+    char buf[BIG_BUF_SIZE];
+    ssize_t bytes = read_text_file("/proc/self/status", buf, sizeof(buf));
+    if (bytes < 0) {
+        return -1;
+    }
+    const char *key = "Mems_allowed:";
+    char *p = strstr(buf, key);
+    if (p == NULL) {
+        return -1;
+    }
+    p += strlen(key);
+    while ((*p != '\0') && isspace((unsigned char)*p)) {
+        p += 1;
+    }
+    int bits = parse_hex_mask_width_bits(p);
+    return round_up_bits_to_unsigned_long_boundary(bits);
+}
+
+
+static int detect_migrate_syscall_maxnode_fallback(void) {
+    int maxnode = (max_node_id_seen >= 0) ? (max_node_id_seen + 1) : 0;
+    return round_up_bits_to_unsigned_long_boundary(maxnode);
+}
+
+
+static int get_migrate_syscall_maxnode(int refresh) {
+    if (!refresh && (migrate_syscall_maxnode > 0)) {
+        return migrate_syscall_maxnode;
+    }
+
+    int detected = detect_migrate_syscall_maxnode_from_status();
+    int fallback = detect_migrate_syscall_maxnode_fallback();
+    int maxnode = MAX(detected, fallback);
+    if (maxnode < 1) {
+        return 0;
+    }
+    migrate_syscall_maxnode = maxnode;
+    return migrate_syscall_maxnode;
 }
 
 static int read_link_basename(const char *path, char *buf, size_t buf_size) {
@@ -2283,13 +2356,36 @@ static int name_starts_with_digit(const struct dirent *dptr) {
 #define  TEST_BIT(i,a) (((a)[(i) / BITS_IN_LONG] &   (1ul << ((i) % BITS_IN_LONG))) != 0)
 #define CLEAR_BIT(i,a)   ((a)[(i) / BITS_IN_LONG] &= ~(1ul << ((i) % BITS_IN_LONG)))
 
-static inline int migrate_numnodes(void) {
-    return (max_node_id_seen >= 0) ? (max_node_id_seen + 1) : 0;
+static inline size_t migrate_mask_bytes(unsigned long maxnode) {
+    size_t nwords = ((size_t)maxnode + BITS_IN_LONG - 1) / BITS_IN_LONG;
+    return nwords * sizeof(unsigned long);
 }
 
-static inline size_t migrate_mask_bytes(int numnodes) {
-    size_t nwords = ((size_t)numnodes + BITS_IN_LONG - 1) / BITS_IN_LONG;
-    return nwords * sizeof(unsigned long);
+
+static void ensure_migrate_masks(size_t num_bytes_in_masks,
+                                 unsigned long **dest_mask_p,
+                                 unsigned long **from_mask_p,
+                                 size_t *allocated_bytes_in_masks_p) {
+    if ((dest_mask_p == NULL) || (from_mask_p == NULL) || (allocated_bytes_in_masks_p == NULL)) {
+        numad_log(LOG_CRIT, "Invalid migrate mask state\n");
+        exit(EXIT_FAILURE);
+    }
+    if (*allocated_bytes_in_masks_p >= num_bytes_in_masks) {
+        return;
+    }
+    unsigned long *new_dest_mask = realloc(*dest_mask_p, num_bytes_in_masks);
+    if (new_dest_mask == NULL) {
+        numad_log(LOG_CRIT, "dest bit mask realloc failed\n");
+        exit(EXIT_FAILURE);
+    }
+    *dest_mask_p = new_dest_mask;
+    unsigned long *new_from_mask = realloc(*from_mask_p, num_bytes_in_masks);
+    if (new_from_mask == NULL) {
+        numad_log(LOG_CRIT, "from bit mask realloc failed\n");
+        exit(EXIT_FAILURE);
+    }
+    *from_mask_p = new_from_mask;
+    *allocated_bytes_in_masks_p = num_bytes_in_masks;
 }
 
 
@@ -2988,26 +3084,14 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, 
         static unsigned long *dest_mask;
         static unsigned long *from_mask;
         static size_t allocated_bytes_in_masks;
-        int numnodes = migrate_numnodes();
-        size_t num_bytes_in_masks = migrate_mask_bytes(numnodes);
-        if ((numnodes < 1) || (num_bytes_in_masks == 0)) {
+        unsigned long migrate_maxnode = (unsigned long)get_migrate_syscall_maxnode(0);
+        size_t num_bytes_in_masks = migrate_mask_bytes(migrate_maxnode);
+        if ((migrate_maxnode < 1) || (num_bytes_in_masks == 0)) {
             migration_possible = 0;
             snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
                      "no NUMA node IDs are available for migrate_pages");
-        } else if (allocated_bytes_in_masks < num_bytes_in_masks) {
-            unsigned long *new_dest_mask = realloc(dest_mask, num_bytes_in_masks);
-            if (new_dest_mask == NULL) {
-                numad_log(LOG_CRIT, "dest bit mask realloc failed\n");
-                exit(EXIT_FAILURE);
-            }
-            dest_mask = new_dest_mask;
-            unsigned long *new_from_mask = realloc(from_mask, num_bytes_in_masks);
-            if (new_from_mask == NULL) {
-                numad_log(LOG_CRIT, "from bit mask realloc failed\n");
-                exit(EXIT_FAILURE);
-            }
-            from_mask = new_from_mask;
-            allocated_bytes_in_masks = num_bytes_in_masks;
+        } else {
+            ensure_migrate_masks(num_bytes_in_masks, &dest_mask, &from_mask, &allocated_bytes_in_masks);
         }
         if (migration_possible) {
             // In an effort to put semi-balanced memory in each target node, move the
@@ -3035,19 +3119,50 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, 
                 }
                 memset(dest_mask, 0, num_bytes_in_masks);
                 memset(from_mask, 0, num_bytes_in_masks);
-                SET_BIT(node_id_from_ix(max_from_node_ix), from_mask);
-                SET_BIT(node_id_from_ix(min_dest_node_ix), dest_mask);
+                int from_node_id = node_id_from_ix(max_from_node_ix);
+                int dest_node_id = node_id_from_ix(min_dest_node_ix);
+                SET_BIT(from_node_id, from_mask);
+                SET_BIT(dest_node_id, dest_mask);
 #if defined(__NR_migrate_pages)
                 migration_attempted = 1;
                 migration_passes += 1;
                 numad_log(LOG_DEBUG, "Moving memory from node: %d to node %d\n",
-                          node_id_from_ix(max_from_node_ix), node_id_from_ix(min_dest_node_ix));
+                          from_node_id, dest_node_id);
                 errno = 0;
-                int rc = syscall(__NR_migrate_pages, p->pid, numnodes, from_mask, dest_mask);
-                numad_log(LOG_DEBUG, "Syscall migrate pages on PID %d, return code %d \n", p->pid, rc);
+                int rc = syscall(__NR_migrate_pages, p->pid, migrate_maxnode, from_mask, dest_mask);
+                numad_log(LOG_DEBUG,
+                          "Syscall migrate_pages(pid=%d, maxnode=%lu, from=%d, to=%d, mask_bytes=%zu) return code %d\n",
+                          p->pid, migrate_maxnode, from_node_id, dest_node_id, num_bytes_in_masks, rc);
                 if (rc >= 0) {
                     migration_partial_pages += rc;
                 } else if (rc < 0) {
+                    if (errno == EINVAL) {
+                        unsigned long refreshed_maxnode = (unsigned long)get_migrate_syscall_maxnode(1);
+                        size_t refreshed_num_bytes = migrate_mask_bytes(refreshed_maxnode);
+                        if ((refreshed_maxnode > 0)
+                            && (refreshed_num_bytes > 0)
+                            && ((refreshed_maxnode != migrate_maxnode)
+                                || (refreshed_num_bytes != num_bytes_in_masks))) {
+                            ensure_migrate_masks(refreshed_num_bytes, &dest_mask, &from_mask,
+                                                 &allocated_bytes_in_masks);
+                            memset(dest_mask, 0, refreshed_num_bytes);
+                            memset(from_mask, 0, refreshed_num_bytes);
+                            SET_BIT(from_node_id, from_mask);
+                            SET_BIT(dest_node_id, dest_mask);
+                            errno = 0;
+                            rc = syscall(__NR_migrate_pages, p->pid, refreshed_maxnode, from_mask, dest_mask);
+                            numad_log(LOG_DEBUG,
+                                      "Retry migrate_pages(pid=%d, maxnode=%lu, from=%d, to=%d, mask_bytes=%zu) return code %d\n",
+                                      p->pid, refreshed_maxnode, from_node_id, dest_node_id,
+                                      refreshed_num_bytes, rc);
+                            migrate_maxnode = refreshed_maxnode;
+                            num_bytes_in_masks = refreshed_num_bytes;
+                            if (rc >= 0) {
+                                migration_partial_pages += rc;
+                                goto migrate_pages_success;
+                            }
+                        }
+                    }
                     // Check errno
                     if (errno == ESRCH) {
                         numad_log(LOG_WARNING, "Tried to move PID %d, but it apparently went away.\n", p->pid);
@@ -3058,7 +3173,9 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, 
                         return 0;  // Assume the process terminated
                     }
                     if (errno == EINVAL) {
-                        numad_log(LOG_WARNING, "Tried to move PID %d, but there are bad parameters.\n", p->pid);
+                        numad_log(LOG_WARNING,
+                                  "Tried to move PID %d from node %d to node %d, but migrate_pages(maxnode=%lu, mask_bytes=%zu) returned EINVAL.\n",
+                                  p->pid, from_node_id, dest_node_id, migrate_maxnode, num_bytes_in_masks);
                         return 0;  // Assume the process terminated
                     }
                     if (errno == EPERM) {
@@ -3074,6 +3191,7 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, 
                          "__NR_migrate_pages is undefined at build time");
                 break;
 #endif
+migrate_pages_success:
                 // Assume memory did move for current accounting purposes...
                 p->process_MBs[min_dest_node_ix] += p->process_MBs[max_from_node_ix];
                 p->process_MBs[max_from_node_ix] = 0;
