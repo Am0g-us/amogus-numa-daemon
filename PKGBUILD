@@ -12,6 +12,7 @@ url="https://github.com/Am0g-us/amogus-numa-daemon"
 license=('LGPL2.1')
 depends=('bash' 'systemd')
 makedepends=('git')
+conflicts=('numad-git')
 optdepends=(
   'logrotate: rotate /var/log/numad.log'
 )
