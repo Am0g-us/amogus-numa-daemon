@@ -3517,8 +3517,11 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     }
   
     // Log advice, and return target node list
-    if ((pid > 0) && (p->bind_time_stamp)) {
+    int target_matches_current = 0;
+    if ((pid > 0) && (p != NULL) && (p->bind_time_stamp)
+        && (p->node_list_p != NULL) && (NUM_IDS_IN_LIST(p->node_list_p) > 0)) {
         str_from_node_ix_list_as_node_ids(buf,  BUF_SIZE, p->node_list_p);
+        target_matches_current = EQUAL_LISTS(target_node_list_p, p->node_list_p);
     } else {
         str_from_node_ix_list_as_node_ids(buf,  BUF_SIZE, all_nodes_list_p);
     }
@@ -3528,7 +3531,11 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     if ((p) && (p->comm)) {
         cmd_name = p->comm;
     }
-    numad_log(LOG_NOTICE, "Advising pid %d %s move from nodes (%s) to nodes (%s)\n", pid, cmd_name, buf, buf2);
+    if (!target_matches_current) {
+        numad_log(LOG_NOTICE, "Advising pid %d %s move from nodes (%s) to nodes (%s)\n", pid, cmd_name, buf, buf2);
+    } else {
+        numad_log(LOG_DEBUG, "PID %d %s target node(s) unchanged (%s)\n", pid, cmd_name, buf2);
+    }
     if (pid > 0) {
         COPY_LIST(target_node_list_p, p->node_list_p);
     }
@@ -3555,7 +3562,10 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
             id_list_p preferred = pick_numa_nodes_core(pid, cpus, mbs,
                                                        assume_enough_cpus,
                                                        preferred_nodes_p);
-            if ((preferred != NULL) && (NUM_IDS_IN_LIST(preferred) > 0)) {
+            if (preferred == NULL) {
+                return NULL;
+            }
+            if (NUM_IDS_IN_LIST(preferred) > 0) {
                 if ((pid > 0) && process_has_graphics_gpu_context(p)
                     && (gpu_graphics_placement != GPU_GRAPHICS_PLACEMENT_AUTO)) {
                     numad_log(LOG_NOTICE,
@@ -3579,9 +3589,33 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
                           gpu_graphics_placement_str(gpu_graphics_placement));
             }
         } else if (pid > 0) {
-            numad_log(LOG_NOTICE,
-                      "PID %d %s has GPU activity but no GPU-local NUMA nodes were discovered; falling back to generic NUMA placement\n",
-                      p->pid, process_comm_name(p));
+            if (process_has_graphics_gpu_context(p)
+                && (p->node_list_p != NULL)
+                && (NUM_IDS_IN_LIST(p->node_list_p) > 0)
+                && (all_nodes_list_p != NULL)
+                && !EQUAL_LISTS(p->node_list_p, all_nodes_list_p)) {
+                char current_buf[BUF_SIZE];
+                str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, p->node_list_p);
+                numad_log(LOG_DEBUG,
+                          "PID %d %s has GPU activity but no GPU-local NUMA nodes were discovered; trying current node(s) (%s) before generic NUMA fallback\n",
+                          p->pid, process_comm_name(p), current_buf);
+                id_list_p sticky = pick_numa_nodes_core(pid, cpus, mbs,
+                                                        assume_enough_cpus,
+                                                        p->node_list_p);
+                if (sticky == NULL) {
+                    return NULL;
+                }
+                if (NUM_IDS_IN_LIST(sticky) > 0) {
+                    return sticky;
+                }
+                numad_log(LOG_NOTICE,
+                          "PID %d %s current node(s) (%s) could not satisfy the request without GPU-local topology; widening to generic NUMA placement\n",
+                          p->pid, process_comm_name(p), current_buf);
+            } else {
+                numad_log(LOG_NOTICE,
+                          "PID %d %s has GPU activity but no GPU-local NUMA nodes were discovered; falling back to generic NUMA placement\n",
+                          p->pid, process_comm_name(p));
+            }
         }
     }
 
@@ -3835,6 +3869,13 @@ int manage_loads() {
                 p->pid, cpu_request, mb_request, assume_enough_cpus);
         }
         pthread_mutex_lock(&node_info_mutex);
+        static id_list_p current_node_list_p;
+        CLEAR_NODE_LIST(current_node_list_p);
+        if ((p->node_list_p != NULL) && (NUM_IDS_IN_LIST(p->node_list_p) > 0)) {
+            COPY_LIST(p->node_list_p, current_node_list_p);
+        } else if (all_nodes_list_p != NULL) {
+            COPY_LIST(all_nodes_list_p, current_node_list_p);
+        }
         id_list_p node_list_p = pick_numa_nodes(p->pid, cpu_request, mb_request, assume_enough_cpus);
         // check return value same as p->node_list_p
         int rc = 0;
@@ -3844,7 +3885,19 @@ int manage_loads() {
             } else {
                 char migrate_reason[BUF_SIZE];
                 int migrate_memory = should_migrate_process_memory(p, migrate_reason, sizeof(migrate_reason));
-                rc = bind_process_and_maybe_migrate_memory(p, migrate_memory, migrate_reason);
+                if ((NUM_IDS_IN_LIST(current_node_list_p) > 0)
+                    && EQUAL_LISTS(node_list_p, current_node_list_p)
+                    && !migrate_memory) {
+                    char current_buf[BUF_SIZE];
+                    str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
+                    p->bind_time_stamp = get_time_stamp();
+                    numad_log(LOG_DEBUG,
+                              "PID %d %s target node(s) unchanged (%s); keeping current affinity because memory migration is skipped: %s\n",
+                              p->pid, process_comm_name(p), current_buf,
+                              (migrate_reason[0] != '\0') ? migrate_reason : "policy decision");
+                } else {
+                    rc = bind_process_and_maybe_migrate_memory(p, migrate_memory, migrate_reason);
+                }
             }
         }
         pthread_mutex_unlock(&node_info_mutex);
