@@ -230,10 +230,19 @@ Interval in seconds between full DRM fdinfo discovery passes.
 .TP
 \fB\-\-gpu-migrate\fR=\fIauto|always|never\fP
 Controls whether numad migrates memory for GPU-active workloads.  In auto mode,
-graphics-oriented GPU processes avoid aggressive memory migration.
+graphics-oriented GPU processes avoid aggressive memory migration and mainly have
+their CPU affinity adjusted unless \fIalways\fP is selected.
 .TP
 \fB\-\-gpu-migrate-busy-max\fR=\fIPCT\fP
 Upper GPU busy threshold for automatic memory migration in \fIauto\fP mode.
+.TP
+\fB\-\-gpu-graphics-placement\fR=\fIauto|prefer|strict\fP
+Select how strongly numad keeps graphics-oriented GPU workloads on the NUMA node
+nearest the active GPU.  \fIauto\fP preserves the historical behavior of trying
+GPU-local nodes first and then falling back to generic NUMA placement.
+\fIprefer\fP makes that soft preference explicit for graphics workloads.
+\fIstrict\fP disables fallback outside GPU-local nodes when valid GPU-local
+NUMA topology was discovered for the graphics workload.
 .TP
 \fB\-\-scx-mode\fR=\fIlegacy|cooperate|observe\fP
 Select how numad cooperates with sched_ext.  In cooperate mode, numad narrows
@@ -246,7 +255,8 @@ Optional advisory hint for the expected sched_ext scheduler profile.
 \fB\-\-bind-cooldown\fR=\fISECONDS\fP
 Minimum delay between repeated rebinding attempts for the same process.
 .LP
-The GPU/SCX long options and \fB\-\-bind-cooldown\fR are startup-only.  When a
+The GPU/SCX long options, including \fB\-\-gpu-graphics-placement\fR, and
+\fB\-\-bind-cooldown\fR are startup-only.  When a
 numad daemon is already running, these options must be changed in
 \fI/etc/numad.conf\fP and applied by restarting the service.
 .SH "AMD GPU AWARE OPERATION"
