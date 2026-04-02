@@ -1595,7 +1595,12 @@ static void apply_reserved_cpu_mask(id_list_p mask) {
     }
 }
 
-static void build_target_cpu_mask(const process_data_p p, id_list_p out) {
+static id_list_p build_target_cpu_mask(const process_data_p p, id_list_p out) {
+    if ((p == NULL) || (p->node_list_p == NULL)) {
+        numad_log(LOG_CRIT, "Cannot build CPU mask for invalid process data\n");
+        exit(EXIT_FAILURE);
+    }
+
     CLEAR_CPU_LIST(out);
     for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
         if (ID_IS_IN_LIST(node_ix, p->node_list_p)) {
@@ -1633,6 +1638,8 @@ static void build_target_cpu_mask(const process_data_p p, id_list_p out) {
         }
         apply_reserved_cpu_mask(out);
     }
+
+    return out;
 }
 
 void process_hash_clear_all_bind_time_stamps() {
@@ -2784,8 +2791,8 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
         exit(EXIT_FAILURE);
     }
     // Generate CPU list derived from target node list.
-    static id_list_p cpu_bind_list_p;
-    build_target_cpu_mask(p, cpu_bind_list_p);
+    static id_list_p cpu_bind_list_p = NULL;
+    cpu_bind_list_p = build_target_cpu_mask(p, cpu_bind_list_p);
     char fname[FNAME_SIZE];
     struct dirent **namelist;
     snprintf(fname, FNAME_SIZE, "/proc/%d/task", p->pid);
