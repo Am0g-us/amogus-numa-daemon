@@ -91,6 +91,7 @@ Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #define DEFAULT_GPU_MIN_VRAM_MB 256
 #define DEFAULT_GPU_FDINFO_DISCOVERY_INTERVAL 15
 #define DEFAULT_GPU_MIGRATE_BUSY_MAX 20
+#define DEFAULT_GPU_GRAPHICS_PLACEMENT 0
 #define DEFAULT_BIND_COOLDOWN_SEC 300
 
 #define PROC_COMM_SIZE 256
@@ -657,6 +658,7 @@ static int str_from_node_ix_list_as_node_ids(char *str_p, int str_size, id_list_
 
     int range_start_id = -1;
     int prev_id = -1;
+    int wrote_any = 0;
     for (int node_ix = 0; (node_ix <= num_nodes); node_ix++) {
         int in_list = ((node_ix < num_nodes) && ID_IS_IN_LIST(node_ix, list_p));
         int cur_id = in_list ? node_id_from_ix(node_ix) : -1;
@@ -671,6 +673,13 @@ static int str_from_node_ix_list_as_node_ids(char *str_p, int str_size, id_list_
             continue;
         }
         if (range_start_id >= 0) {
+            if (wrote_any) {
+                if (str_size - (p - str_p) <= 1) {
+                    break;
+                }
+                *p++ = ',';
+                *p = '\0';
+            }
             int written = snprintf(p, str_size - (p - str_p), "%d", range_start_id);
             if ((written < 0) || (written >= str_size - (p - str_p))) {
                 break;
@@ -683,10 +692,7 @@ static int str_from_node_ix_list_as_node_ids(char *str_p, int str_size, id_list_
                 }
                 p += written;
             }
-            if ((node_ix < num_nodes) && (str_size - (p - str_p) > 1)) {
-                *p++ = ',';
-                *p = '\0';
-            }
+            wrote_any = 1;
             range_start_id = -1;
             prev_id = -1;
         }
@@ -793,6 +799,12 @@ typedef enum {
 } migrate_policy_t;
 
 typedef enum {
+    GPU_GRAPHICS_PLACEMENT_AUTO = 0,
+    GPU_GRAPHICS_PLACEMENT_PREFER,
+    GPU_GRAPHICS_PLACEMENT_STRICT,
+} gpu_graphics_placement_t;
+
+typedef enum {
     SCX_MODE_LEGACY = 0,
     SCX_MODE_COOPERATE,
     SCX_MODE_OBSERVE,
@@ -821,6 +833,7 @@ uint64_t gpu_topology_time_stamp = 0;
 uint64_t gpu_fdinfo_last_full_scan = 0;
 gpu_backend_t gpu_backend = GPU_BACKEND_AUTO;
 migrate_policy_t gpu_migrate_policy = MIGRATE_AUTO;
+gpu_graphics_placement_t gpu_graphics_placement = DEFAULT_GPU_GRAPHICS_PLACEMENT;
 scx_mode_t scx_mode = SCX_MODE_COOPERATE;
 scx_sched_t scx_sched = SCX_SCHED_NONE;
 int scx_enabled = 0;
@@ -1317,26 +1330,80 @@ static void clear_stale_gpu_state(process_data_p p) {
     }
 }
 
-static int should_migrate_process_memory(const process_data_p p) {
+static const char *process_comm_name(const process_data_p p) {
+    return ((p != NULL) && (p->comm[0] != '\0')) ? p->comm : "(unknown)";
+}
+
+static const char *gpu_kind_str(gpu_kind_t kind) {
+    switch (kind) {
+    case GPU_KIND_COMPUTE:
+        return "compute";
+    case GPU_KIND_GRAPHICS:
+        return "graphics";
+    case GPU_KIND_MIXED:
+        return "mixed";
+    case GPU_KIND_NONE:
+    default:
+        return "none";
+    }
+}
+
+static const char *gpu_graphics_placement_str(gpu_graphics_placement_t placement) {
+    switch (placement) {
+    case GPU_GRAPHICS_PLACEMENT_PREFER:
+        return "prefer";
+    case GPU_GRAPHICS_PLACEMENT_STRICT:
+        return "strict";
+    case GPU_GRAPHICS_PLACEMENT_AUTO:
+    default:
+        return "auto";
+    }
+}
+
+static int process_has_graphics_gpu_context(const process_data_p p) {
+    return ((p != NULL)
+            && (p->flags & PROCESS_FLAG_GPU_ACTIVE)
+            && (((p->flags & PROCESS_FLAG_GPU_GRAPHICS) != 0)
+                || (p->gpu_kind == GPU_KIND_GRAPHICS)
+                || (p->gpu_kind == GPU_KIND_MIXED)));
+}
+
+static int should_migrate_process_memory(const process_data_p p, char *reason_buf, size_t reason_buf_size) {
+#define SET_MIGRATE_REASON(fmt, ...) \
+    do { \
+        if ((reason_buf != NULL) && (reason_buf_size > 0)) { \
+            snprintf(reason_buf, reason_buf_size, fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
     if (gpu_migrate_policy == MIGRATE_NEVER) {
+        SET_MIGRATE_REASON("policy=never");
         return 0;
     }
     if (gpu_migrate_policy == MIGRATE_ALWAYS) {
+        SET_MIGRATE_REASON("policy=always");
         return 1;
     }
     if ((p == NULL) || !(p->flags & PROCESS_FLAG_GPU_ACTIVE)) {
+        SET_MIGRATE_REASON("CPU-only or non-GPU workload");
         return 1;
     }
     if (p->gpu_kind == GPU_KIND_GRAPHICS) {
+        SET_MIGRATE_REASON("graphics GPU workload under --gpu-migrate=auto");
         return 0;
     }
     if (p->gpu_busy_pct > (uint32_t)gpu_migrate_busy_max) {
+        SET_MIGRATE_REASON("GPU busy %u%% exceeds --gpu-migrate-busy-max=%d", p->gpu_busy_pct, gpu_migrate_busy_max);
         return 0;
     }
     if ((p->gpu_list_p != NULL) && (NUM_IDS_IN_LIST(p->gpu_list_p) > 1)) {
+        SET_MIGRATE_REASON("multiple active GPU NUMA domains under --gpu-migrate=auto");
         return 0;
     }
+    SET_MIGRATE_REASON("eligible GPU workload under --gpu-migrate=auto");
     return 1;
+
+#undef SET_MIGRATE_REASON
 }
 
 static void refresh_scx_state(void) {
@@ -1885,10 +1952,11 @@ void print_usage_and_exit(char *prog_name) {
     fprintf(stderr, "--gpu-fdinfo-discovery=<sec>\n");
     fprintf(stderr, "--gpu-migrate=auto|always|never\n");
     fprintf(stderr, "--gpu-migrate-busy-max=<N>\n");
+    fprintf(stderr, "--gpu-graphics-placement=auto|prefer|strict\n");
     fprintf(stderr, "--scx-mode=legacy|cooperate|observe\n");
     fprintf(stderr, "--scx-sched=auto|beerland|p2dq\n");
     fprintf(stderr, "--bind-cooldown=<sec>\n");
-    fprintf(stderr, "Note: GPU/SCX long options and --bind-cooldown are startup-only.\n");
+    fprintf(stderr, "Note: GPU/SCX long options (including --gpu-graphics-placement) and --bind-cooldown are startup-only.\n");
     exit(EXIT_FAILURE);
 }
 
@@ -2778,7 +2846,7 @@ static int cmp_ints_by_ref(const void *p1, const void *p2) {
 */
 
 
-int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) {
+int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, const char *migrate_reason) {
     uint64_t t0 = get_time_stamp();
     // Parameter p is a pointer to an element in the hash table
     if ((!p) || (p->pid < 1)) {
@@ -2790,6 +2858,16 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
         numad_log(LOG_CRIT, "Cannot bind to unspecified node(s)\n");
         exit(EXIT_FAILURE);
     }
+    char node_list_str[BUF_SIZE];
+    str_from_node_ix_list_as_node_ids(node_list_str, BUF_SIZE, p->node_list_p);
+    int affinity_errors = 0;
+    int migration_requested = migrate_memory;
+    int migration_possible = migrate_memory;
+    int migration_attempted = 0;
+    int migration_passes = 0;
+    int migration_partial_pages = 0;
+    char runtime_migrate_reason[BUF_SIZE];
+    runtime_migrate_reason[0] = '\0';
     // Generate CPU list derived from target node list.
     static id_list_p cpu_bind_list_p = NULL;
     cpu_bind_list_p = build_target_cpu_mask(p, cpu_bind_list_p);
@@ -2806,6 +2884,7 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
         int tid = atoi(namelist[namelist_ix]->d_name);
         int rc = sched_setaffinity(tid, ID_LIST_BYTES(cpu_bind_list_p), ID_LIST_SET_P(cpu_bind_list_p));
         if (rc < 0) {
+            affinity_errors += 1;
             if (errno == ESRCH) {
                 numad_log(LOG_WARNING, "Tried to bind PID %d, TID %d, but it apparently went away.\n", p->pid, tid);
             }
@@ -2814,7 +2893,8 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
         free(namelist[namelist_ix]);
     }
     free(namelist);
-    if (migrate_memory) {
+    uint64_t t_affinity = get_time_stamp();
+    if (migration_requested) {
         // Now move the memory to the target nodes....
         static unsigned long *dest_mask;
         static unsigned long *from_mask;
@@ -2822,8 +2902,9 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
         int numnodes = migrate_numnodes();
         size_t num_bytes_in_masks = migrate_mask_bytes(numnodes);
         if ((numnodes < 1) || (num_bytes_in_masks == 0)) {
-            numad_log(LOG_WARNING, "Skipping migrate_pages for PID %d because no NUMA node IDs are available\n", p->pid);
-            migrate_memory = 0;
+            migration_possible = 0;
+            snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                     "no NUMA node IDs are available for migrate_pages");
         } else if (allocated_bytes_in_masks < num_bytes_in_masks) {
             unsigned long *new_dest_mask = realloc(dest_mask, num_bytes_in_masks);
             if (new_dest_mask == NULL) {
@@ -2839,7 +2920,7 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
             from_mask = new_from_mask;
             allocated_bytes_in_masks = num_bytes_in_masks;
         }
-        if (migrate_memory) {
+        if (migration_possible) {
             // In an effort to put semi-balanced memory in each target node, move the
             // contents from the source node with the max amount of memory to the
             // destination node with the least amount of memory.  Repeat until done.
@@ -2868,14 +2949,15 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
                 SET_BIT(node_id_from_ix(max_from_node_ix), from_mask);
                 SET_BIT(node_id_from_ix(min_dest_node_ix), dest_mask);
 #if defined(__NR_migrate_pages)
+                migration_attempted = 1;
+                migration_passes += 1;
                 numad_log(LOG_DEBUG, "Moving memory from node: %d to node %d\n",
                           node_id_from_ix(max_from_node_ix), node_id_from_ix(min_dest_node_ix));
+                errno = 0;
                 int rc = syscall(__NR_migrate_pages, p->pid, numnodes, from_mask, dest_mask);
                 numad_log(LOG_DEBUG, "Syscall migrate pages on PID %d, return code %d \n", p->pid, rc);
-                if (rc > 2) {
-                    // rc == the number of pages that could not be moved.
-                    // A couple pages not moving is probably not a problem, hence ignoring rc == 1 or 2.
-                    numad_log(LOG_WARNING, "Tried to move PID %d, but %d pages would not move.\n", p->pid, rc);
+                if (rc >= 0) {
+                    migration_partial_pages += rc;
                 } else if (rc < 0) {
                     // Check errno
                     if (errno == ESRCH) {
@@ -2894,10 +2976,14 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
                         numad_log(LOG_WARNING, "Tried to move PID %d, but there is insufficient privilege.\n", p->pid);
                         return 0;  // Assume the process terminated
                     }
+                    numad_log(LOG_WARNING, "Tried to move PID %d, but migrate_pages failed with errno %d.\n", p->pid, errno);
+                    return 0;
                 }
 #else
-                numad_log(LOG_WARNING, "Would move memory from node %d to node %d, but __NR_migrate_pages undefined\n",
-                        node_id_from_ix(max_from_node_ix), node_id_from_ix(min_dest_node_ix));
+                migration_possible = 0;
+                snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                         "__NR_migrate_pages is undefined at build time");
+                break;
 #endif
                 // Assume memory did move for current accounting purposes...
                 p->process_MBs[min_dest_node_ix] += p->process_MBs[max_from_node_ix];
@@ -2914,9 +3000,33 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory) 
     } else {
         uint64_t t1 = get_time_stamp();
         p->bind_time_stamp = t1;
-        char node_list_str[BUF_SIZE];
-        str_from_node_ix_list_as_node_ids(node_list_str, BUF_SIZE, p->node_list_p);
-        numad_log(LOG_NOTICE, "PID %d moved to node(s) %s in %d.%d seconds\n", p->pid, node_list_str, (t1-t0)/100, (t1-t0)%100);
+        if (affinity_errors > 0) {
+            numad_log(LOG_WARNING, "PID %d affinity target node(s) %s applied with %d task affinity error(s) in %d.%d seconds\n",
+                      p->pid, node_list_str, affinity_errors, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
+        } else {
+            numad_log(LOG_NOTICE, "PID %d affinity applied to node(s) %s in %d.%d seconds\n",
+                      p->pid, node_list_str, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
+        }
+        if (!migration_requested) {
+            numad_log(LOG_NOTICE, "PID %d memory migration skipped: %s\n", p->pid,
+                      ((migrate_reason != NULL) && (*migrate_reason != '\0')) ? migrate_reason : "policy decision");
+        } else if (!migration_possible) {
+            numad_log(LOG_NOTICE, "PID %d memory migration skipped: %s\n", p->pid,
+                      (runtime_migrate_reason[0] != '\0') ? runtime_migrate_reason : "runtime conditions");
+        } else if (!migration_attempted) {
+            numad_log(LOG_NOTICE, "PID %d memory migration not needed for target node(s) %s\n",
+                      p->pid, node_list_str);
+        } else if (migration_partial_pages > 0) {
+            numad_log(LOG_NOTICE,
+                      "PID %d memory migration partial toward node(s) %s: %d pages could not be moved across %d pass(es) in %d.%d seconds\n",
+                      p->pid, node_list_str, migration_partial_pages, migration_passes,
+                      (t1 - t_affinity) / 100, (t1 - t_affinity) % 100);
+        } else {
+            numad_log(LOG_NOTICE,
+                      "PID %d memory migration completed toward node(s) %s across %d pass(es) in %d.%d seconds\n",
+                      p->pid, node_list_str, migration_passes,
+                      (t1 - t_affinity) / 100, (t1 - t_affinity) % 100);
+        }
         return 1;
     }
 }
@@ -2933,6 +3043,25 @@ static void build_gpu_preferred_nodes(const process_data_p p, id_list_p out) {
             ADD_ID_TO_LIST(gpu[g].numa_node_ix, out);
         }
     }
+}
+
+static void log_gpu_placement_context(const process_data_p p, id_list_p preferred_nodes_p) {
+    if ((p == NULL) || !(p->flags & PROCESS_FLAG_GPU_ACTIVE)) {
+        return;
+    }
+
+    char gpu_nodes[BUF_SIZE];
+    if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
+        str_from_node_ix_list_as_node_ids(gpu_nodes, sizeof(gpu_nodes), preferred_nodes_p);
+    } else {
+        snprintf(gpu_nodes, sizeof(gpu_nodes), "none");
+    }
+
+    numad_log(LOG_NOTICE,
+              "PID %d %s GPU context: kind=%s busy=%u%% vram=%lluMB gpu-node(s) (%s) graphics-placement=%s\n",
+              p->pid, process_comm_name(p), gpu_kind_str(p->gpu_kind), p->gpu_busy_pct,
+              (unsigned long long)p->gpu_vram_mb, gpu_nodes,
+              gpu_graphics_placement_str(gpu_graphics_placement));
 }
 
 static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_enough_cpus,
@@ -3328,13 +3457,42 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
     static id_list_p preferred_nodes_p;
     if ((p != NULL) && (p->flags & PROCESS_FLAG_GPU_ACTIVE)) {
         build_gpu_preferred_nodes(p, preferred_nodes_p);
+        if (pid > 0) {
+            log_gpu_placement_context(p, preferred_nodes_p);
+        }
         if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
+            char preferred_buf[BUF_SIZE];
+            str_from_node_ix_list_as_node_ids(preferred_buf, BUF_SIZE, preferred_nodes_p);
             id_list_p preferred = pick_numa_nodes_core(pid, cpus, mbs,
                                                        assume_enough_cpus,
                                                        preferred_nodes_p);
             if ((preferred != NULL) && (NUM_IDS_IN_LIST(preferred) > 0)) {
+                if ((pid > 0) && process_has_graphics_gpu_context(p)
+                    && (gpu_graphics_placement != GPU_GRAPHICS_PLACEMENT_AUTO)) {
+                    numad_log(LOG_NOTICE,
+                              "PID %d %s graphics GPU placement policy %s selected GPU-local node(s) (%s)\n",
+                              p->pid, process_comm_name(p),
+                              gpu_graphics_placement_str(gpu_graphics_placement), preferred_buf);
+                }
                 return preferred;
             }
+            if ((pid > 0) && process_has_graphics_gpu_context(p)
+                && (gpu_graphics_placement == GPU_GRAPHICS_PLACEMENT_STRICT)) {
+                numad_log(LOG_NOTICE,
+                          "PID %d %s strict graphics GPU placement refused fallback from GPU-local node(s) (%s); keeping current binding\n",
+                          p->pid, process_comm_name(p), preferred_buf);
+                return preferred;
+            }
+            if (pid > 0) {
+                numad_log(LOG_NOTICE,
+                          "PID %d %s GPU-local node(s) (%s) could not satisfy the request; falling back to generic NUMA placement (policy=%s)\n",
+                          p->pid, process_comm_name(p), preferred_buf,
+                          gpu_graphics_placement_str(gpu_graphics_placement));
+            }
+        } else if (pid > 0) {
+            numad_log(LOG_NOTICE,
+                      "PID %d %s has GPU activity but no GPU-local NUMA nodes were discovered; falling back to generic NUMA placement\n",
+                      p->pid, process_comm_name(p));
         }
     }
 
@@ -3595,7 +3753,9 @@ int manage_loads() {
             if (scx_mode == SCX_MODE_OBSERVE) {
                 numad_log(LOG_NOTICE, "SCX observe mode: PID %d would be rebound now\n", p->pid);
             } else {
-                rc = bind_process_and_maybe_migrate_memory(p, should_migrate_process_memory(p));
+                char migrate_reason[BUF_SIZE];
+                int migrate_memory = should_migrate_process_memory(p, migrate_reason, sizeof(migrate_reason));
+                rc = bind_process_and_maybe_migrate_memory(p, migrate_memory, migrate_reason);
             }
         }
         pthread_mutex_unlock(&node_info_mutex);
@@ -3774,6 +3934,7 @@ enum {
     OPT_GPU_FDINFO_DISCOVERY,
     OPT_GPU_MIGRATE,
     OPT_GPU_MIGRATE_BUSY_MAX,
+    OPT_GPU_GRAPHICS_PLACEMENT,
     OPT_SCX_MODE,
     OPT_SCX_SCHED,
     OPT_BIND_COOLDOWN,
@@ -3787,6 +3948,7 @@ static const struct option long_opts[] = {
     {"gpu-fdinfo-discovery", required_argument, NULL, OPT_GPU_FDINFO_DISCOVERY},
     {"gpu-migrate", required_argument, NULL, OPT_GPU_MIGRATE},
     {"gpu-migrate-busy-max", required_argument, NULL, OPT_GPU_MIGRATE_BUSY_MAX},
+    {"gpu-graphics-placement", required_argument, NULL, OPT_GPU_GRAPHICS_PLACEMENT},
     {"scx-mode", required_argument, NULL, OPT_SCX_MODE},
     {"scx-sched", required_argument, NULL, OPT_SCX_SCHED},
     {"bind-cooldown", required_argument, NULL, OPT_BIND_COOLDOWN},
@@ -3871,6 +4033,18 @@ static void parse_startup_long_option_or_exit(int opt, const char *arg) {
             exit(EXIT_FAILURE);
         }
         gpu_migrate_busy_max = value;
+        break;
+    case OPT_GPU_GRAPHICS_PLACEMENT:
+        if (strcmp(arg, "auto") == 0) {
+            gpu_graphics_placement = GPU_GRAPHICS_PLACEMENT_AUTO;
+        } else if (strcmp(arg, "prefer") == 0) {
+            gpu_graphics_placement = GPU_GRAPHICS_PLACEMENT_PREFER;
+        } else if (strcmp(arg, "strict") == 0) {
+            gpu_graphics_placement = GPU_GRAPHICS_PLACEMENT_STRICT;
+        } else {
+            fprintf(stderr, "--gpu-graphics-placement must be auto, prefer, or strict\n");
+            exit(EXIT_FAILURE);
+        }
         break;
     case OPT_SCX_MODE:
         if (strcmp(arg, "legacy") == 0) {
@@ -4033,6 +4207,7 @@ int main(int argc, char *argv[]) {
         case OPT_GPU_FDINFO_DISCOVERY:
         case OPT_GPU_MIGRATE:
         case OPT_GPU_MIGRATE_BUSY_MAX:
+        case OPT_GPU_GRAPHICS_PLACEMENT:
         case OPT_SCX_MODE:
         case OPT_SCX_SCHED:
         case OPT_BIND_COOLDOWN:
@@ -4064,7 +4239,7 @@ int main(int argc, char *argv[]) {
     if (daemon_pid > 0) {
         if (startup_only_longopt_seen) {
             fprintf(stderr,
-                    "GPU/SCX long options and --bind-cooldown are startup-only. Edit /etc/numad.conf and restart the numad service.\n");
+                    "GPU/SCX long options (including --gpu-graphics-placement) and --bind-cooldown are startup-only. Edit /etc/numad.conf and restart the numad service.\n");
             close_log_file();
             exit(EXIT_FAILURE);
         }

@@ -47,6 +47,7 @@ This fork adds GPU-aware placement logic for AMD GPU systems.
 - GPU topology discovery through sysfs / DRM
 - GPU-local CPU narrowing using device `local_cpus`
 - GPU-aware NUMA node preference
+- switchable graphics placement policy: `auto`, `prefer`, or `strict`
 - DRM `fdinfo`-based process activity tracking
 - stale GPU state aging and cleanup
 - safer handling of low-RSS but GPU-significant processes
@@ -56,6 +57,17 @@ This fork adds GPU-aware placement logic for AMD GPU systems.
 The currently implemented process telemetry path is based on **DRM `fdinfo`**.
 
 The `amdsmi` backend option is currently treated as a warning/fallback path rather than a fully implemented collector.
+
+### Graphics placement policy
+
+`amogus-numa-daemon` now exposes `--gpu-graphics-placement=auto|prefer|strict` for graphics-oriented GPU workloads.
+
+- `auto` keeps the historical behavior: try GPU-local NUMA nodes first, then fall back to generic NUMA placement when needed.
+- `prefer` is the explicit soft mode: GUI / graphics processes prefer GPU-local NUMA nodes, but fallback remains allowed.
+- `strict` is the hard mode: when a graphics process has valid GPU-local NUMA node information, fallback outside those nodes is refused.
+
+This policy only affects node selection. Memory migration remains controlled separately by `--gpu-migrate`.
+With `--gpu-migrate=auto`, pure graphics workloads still avoid aggressive page migration; the daemon now logs CPU affinity changes and memory migration decisions separately so this is visible in the log.
 
 ## `sched_ext` compatibility
 
