@@ -869,6 +869,7 @@ static int name_starts_with_digit(const struct dirent *dptr);
 int get_stat_data_for_pid(int pid, process_data_p out);
 int process_hash_lookup(int pid);
 int process_hash_update(process_data_p newp);
+static const char *process_comm_name(const process_data_p p);
 extern process_data_p process_hash_table;
 
 static int drm_card_and_digits(const struct dirent *dptr) {
@@ -920,12 +921,62 @@ static int read_link_basename(const char *path, char *buf, size_t buf_size) {
     return 0;
 }
 
+static void normalize_pci_bdf(const char *src, char *dst, size_t dst_size) {
+    if ((dst == NULL) || (dst_size < 2)) {
+        return;
+    }
+    dst[0] = '\0';
+    if (src == NULL) {
+        return;
+    }
+
+    const char *p = skip_spaces_const(src);
+    if (p == NULL) {
+        return;
+    }
+    if ((((p[0] == 'p') || (p[0] == 'P')))
+        && (((p[1] == 'c') || (p[1] == 'C')))
+        && (((p[2] == 'i') || (p[2] == 'I')))
+        && (p[3] == ':')) {
+        p += 4;
+    }
+    while ((*p != '\0') && isspace((unsigned char)*p)) {
+        p += 1;
+    }
+
+    size_t n = 0;
+    while ((*p != '\0') && !isspace((unsigned char)*p) && (n + 1 < dst_size)) {
+        dst[n++] = (char)tolower((unsigned char)*p);
+        p += 1;
+    }
+    dst[n] = '\0';
+
+    if ((n == 7) && (dst[2] == ':') && (dst[5] == '.')) {
+        char tmp[GPU_BDF_SIZE];
+        snprintf(tmp, sizeof(tmp), "0000:%s", dst);
+        strncpy(dst, tmp, dst_size - 1);
+        dst[dst_size - 1] = '\0';
+    } else if ((n == 5) && (dst[2] == ':')) {
+        char tmp[GPU_BDF_SIZE];
+        snprintf(tmp, sizeof(tmp), "0000:%s.0", dst);
+        strncpy(dst, tmp, dst_size - 1);
+        dst[dst_size - 1] = '\0';
+    } else if ((n == 10) && (dst[4] == ':') && (dst[7] == ':')) {
+        char tmp[GPU_BDF_SIZE];
+        snprintf(tmp, sizeof(tmp), "%s.0", dst);
+        strncpy(dst, tmp, dst_size - 1);
+        dst[dst_size - 1] = '\0';
+    }
+}
+
 static int gpu_index_from_pci_bdf(const char *bdf) {
-    if ((bdf == NULL) || (*bdf == '\0')) {
+    char normalized[GPU_BDF_SIZE];
+    normalize_pci_bdf(bdf, normalized, sizeof(normalized));
+    if (normalized[0] == '\0') {
         return -1;
     }
     for (int ix = 0; ix < gpu_count; ix++) {
-        if (gpu[ix].valid && (strcmp(gpu[ix].pci_bdf, bdf) == 0)) {
+        if (gpu[ix].valid && (strcmp(gpu[ix].pci_bdf, normalized) == 0)) {
             return ix;
         }
     }
@@ -1041,7 +1092,9 @@ static int discover_amdgpu_devices_from_sysfs(void) {
         g->dev_ix = gpu_count;
         strncpy(g->drm_name, card, sizeof(g->drm_name) - 1);
         snprintf(path, sizeof(path), "/sys/class/drm/%s/device", card);
-        read_link_basename(path, g->pci_bdf, sizeof(g->pci_bdf));
+        if (read_link_basename(path, buf, sizeof(buf)) == 0) {
+            normalize_pci_bdf(buf, g->pci_bdf, sizeof(g->pci_bdf));
+        }
 
         snprintf(path, sizeof(path), "/sys/class/drm/%s/device/numa_node", card);
         if (read_int_file(path, &g->numa_node_id) == 0) {
@@ -1058,6 +1111,12 @@ static int discover_amdgpu_devices_from_sysfs(void) {
         }
 
         g->valid = 1;
+        numad_log(LOG_DEBUG,
+                  "Discovered AMD GPU %s pci=%s numa_node=%d numa_node_ix=%d\n",
+                  g->drm_name,
+                  (g->pci_bdf[0] != '\0') ? g->pci_bdf : "(unknown)",
+                  g->numa_node_id,
+                  g->numa_node_ix);
         gpu_count += 1;
         free(namelist[ix]);
     }
@@ -1088,9 +1147,12 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
     int found = 0;
     int saw_compute = 0;
     int saw_graphics = 0;
+    int saw_missing_pdev = 0;
+    int saw_unmatched_pdev = 0;
     uint64_t total_engine_ns = 0;
     uint64_t total_vram_mb = 0;
     char file_buf[BIG_BUF_SIZE];
+    char first_unmatched_pdev[GPU_BDF_SIZE] = {0};
     fdinfo_client_acc_t *clients = calloc(files, sizeof(*clients));
     if ((files > 0) && (clients == NULL)) {
         numad_log(LOG_CRIT, "fdinfo client accumulator calloc failed\n");
@@ -1121,7 +1183,7 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
                 }
             } else if (strncmp(line, "drm-pdev:", 9) == 0) {
                 const char *v = skip_spaces_const(line + 9);
-                strncpy(pdev, v, sizeof(pdev) - 1);
+                normalize_pci_bdf(v, pdev, sizeof(pdev));
             } else if (strncmp(line, "drm-client-id:", 14) == 0) {
                 const char *v = skip_spaces_const(line + 14);
                 errno = 0;
@@ -1155,7 +1217,15 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
                     CPU_ZERO_S(sample->gpu_list_p->bytes, sample->gpu_list_p->set_p);
                 }
                 ADD_ID_TO_LIST(gpu_ix, sample->gpu_list_p);
+            } else {
+                saw_unmatched_pdev = 1;
+                if (first_unmatched_pdev[0] == '\0') {
+                    strncpy(first_unmatched_pdev, pdev, sizeof(first_unmatched_pdev) - 1);
+                    first_unmatched_pdev[sizeof(first_unmatched_pdev) - 1] = '\0';
+                }
             }
+        } else if (pdev[0] == '\0') {
+            saw_missing_pdev = 1;
         }
 
         if (client_id_valid && (pdev[0] != '\0')) {
@@ -1189,6 +1259,25 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
 
     if (!found) {
         return -1;
+    }
+
+    if (((sample->gpu_list_p == NULL) || (NUM_IDS_IN_LIST(sample->gpu_list_p) == 0))
+        && (gpu_count == 1) && gpu[0].valid) {
+        if (sample->gpu_list_p == NULL) {
+            INIT_ID_LIST(sample->gpu_list_p, 1);
+            CPU_ZERO_S(sample->gpu_list_p->bytes, sample->gpu_list_p->set_p);
+        }
+        ADD_ID_TO_LIST(0, sample->gpu_list_p);
+        numad_log(LOG_DEBUG,
+                  "PID %d %s GPU fdinfo matched via single-GPU fallback (missing_pdev=%d unmatched_pdev=%d first_unmatched=%s)\n",
+                  pid, process_comm_name(sample), saw_missing_pdev, saw_unmatched_pdev,
+                  (first_unmatched_pdev[0] != '\0') ? first_unmatched_pdev : "none");
+    } else if (((sample->gpu_list_p == NULL) || (NUM_IDS_IN_LIST(sample->gpu_list_p) == 0))
+               && (saw_missing_pdev || saw_unmatched_pdev)) {
+        numad_log(LOG_DEBUG,
+                  "PID %d %s has AMD GPU activity but fdinfo device matching failed (missing_pdev=%d unmatched_pdev=%d first_unmatched=%s)\n",
+                  pid, process_comm_name(sample), saw_missing_pdev, saw_unmatched_pdev,
+                  (first_unmatched_pdev[0] != '\0') ? first_unmatched_pdev : "none");
     }
 
     sample->flags |= PROCESS_FLAG_GPU_ACTIVE;
