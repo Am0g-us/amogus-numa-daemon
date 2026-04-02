@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+if [ -r /etc/numad.conf ]; then
+    . /etc/numad.conf
+fi
+
+exec /usr/bin/numad ${NUMAD_ARGS:--i ${INTERVAL:-15}}

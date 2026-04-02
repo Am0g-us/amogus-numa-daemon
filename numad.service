@@ -1,0 +1,10 @@
+[Unit]
+Description=numad - The NUMA daemon that manages application locality
+Documentation=man:numad
+
+[Service]
+Type=forking
+ExecStart=/usr/lib/numad/numad-wrapper
+
+[Install]
+WantedBy=multi-user.target

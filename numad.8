@@ -1,0 +1,318 @@
+.TH "numad" "8" "1.0.0" "Bill Gray" "Administration"
+.SH "NAME"
+.LP
+numad \- A user\-level daemon that provides placement advice and process
+management for efficient use of CPUs and memory on systems with NUMA topology.
+.SH "SYNOPSIS"
+.LP
+numad [\fI\-dhvV\fP]
+.br
+.LP
+numad  [\fI\-C 0|1\fP]
+.br
+.LP
+numad  [\fI\-H THP_hugepage_scan_sleep_ms\fP]
+.br
+.LP
+numad  [\fI\-i [min_interval:]max_interval\fP]
+.br
+.LP
+numad  [\fI\-K 0|1\fP]
+.br
+.LP
+numad  [\fI\-l log_level\fP]
+.br
+.LP
+numad  [\fI\-m target_memory_locality\fP]
+.br
+.LP
+numad  [\fI\-p PID\fP]
+.br
+.LP
+numad  [\fI\-r PID\fP]
+.br
+.LP
+numad  [\fI\-R reserved-CPU-list\fP]
+.br
+.LP
+numad  [\fI\-S 0|1\fP]
+.br
+.LP
+numad  [\fI\-t logical_CPU_percent\fP]
+.br
+.LP
+numad  [\fI\-u target_utilization\fP]
+.br
+.LP
+numad  [\fI\-w NCPUS[:MB]\fP]
+.br
+.LP
+numad  [\fI\-x PID\fP]
+.br
+.SH "DESCRIPTION"
+.LP
+Numad is a system daemon that monitors NUMA topology and resource usage. It
+will attempt to locate processes for efficient NUMA locality and affinity,
+dynamically adjusting to changing system conditions.  Numad also provides
+guidance to assist management applications with initial manual binding of CPU
+and memory resources for their processes.  Note that numad is primarily
+intended for server consolidation environments, where there might be multiple
+applications or multiple virtual guests running on the same server system.
+Numad is most likely to have a positive effect when processes can be localized
+in a subset of the system's NUMA nodes.  If the entire system is dedicated to a
+large in-memory database application, for example -- especially if memory
+accesses will likely remain unpredictable -- numad will probably not improve
+performance.
+.SH "OPTIONS"
+.LP
+.TP
+\fB\-C\fR <\fI0|1\fP>
+This option controls whether or not numad treats inactive file cache as
+available memory. By default, numad assumes it can count inactive file cache as
+"free" memory when considering resources to match with processes.  Specify
+\fI\-C 0\fP if numad should instead consider inactive file cache as a consumed
+resource.
+.TP
+\fB\-d\fR
+Debug output in log, sets the log level to LOG_DEBUG.  Same effect as \fI\-l 7\fP.
+.TP
+\fB\-h\fR
+Display usage help information and then exit.
+.TP
+\fB\-H\fR  <\fITHP_scan_sleep_ms\fP>
+Set the desired transparent hugepage scan interval in ms.  The
+.na
+/sys/kernel/mm/tranparent_hugepage/khugepaged/scan_sleep_millisecs
+.ad
+tunable is usually set to 10000ms by the operating system.  The default is
+changed by numad to be 1000ms since it is helpful for the hugepage daemon to be
+more aggressive when memory moves between nodes.  Specifying (\fI\-H 0\fP) will
+cause numad to retain the system default value.  You can also make the hugepage
+daemon more or less aggressive by specifying an alternate value with this
+option.  For example, setting this value to 100ms (\fI\-H 100\fP) might improve
+the performance of workloads which use many transparent hugepages.
+.TP
+\fB\-i\fR <\fI[min_interval:]max_interval\fP>
+Sets the time interval that numad waits between system scans, in seconds to
+<\fImax_interval\fP>. Default <\fImax_interval\fP> is 15 seconds, default
+<\fImin_interval\fP> is 5 seconds.  Setting a <\fImax_interval\fP> of zero will
+cause the daemon to exit.  (This is the normal mechanism to terminate the
+daemon.)  A bigger <\fImax_interval\fP> will decrease numad overhead but also
+decrease responsiveness to changing loads.  The default numad max_interval can
+be changed in the numad.conf file.
+.TP
+\fB\-K\fR <\fI0|1\fP>
+This option controls whether numad keeps interleaved memory spread across NUMA
+nodes, or attempts to merge interleaved memory to local NUMA nodes.  The
+default is to merge interleaved memory.  This is the appropriate setting to
+localize processes in a subset of the system's NUMA nodes.  If you are running
+a large, single-instance application that allocates interleaved memory because
+the workload will have continuous unpredictable memory access patterns (e.g. a
+large in-memory database), you might get better results by specifying \fI\-K
+1\fP to instruct numad to keep interleaved memory distributed.
+.TP
+\fB\-l\fR <\fIlog_level\fP>
+Sets the log level to <\fIlog_level\fP>.  Reasonable choices are 5, 6, or 7.
+The default value is 5.  Note that CPU values are scaled by a factor of 100
+internally and in the numad log files.  Unfortunately, you don't actually have
+that many CPUs.
+.TP
+\fB\-m\fR  <\fItarget_memory_locality\fP>
+Set the desired memory locality threshold to stop moving process memory.  Numad
+might stop retrying to coalesce process memory when more than this percentage
+of the process's memory is already localized in the target node(s).  The
+default is 90%. Numad will frequently localize more than the localization
+threshold percent, but it will not necessarily do so.  Decrease the threshold
+to allow numad to leave more process memory distributed on various nodes.
+Increase the threshold to instruct numad to try to localize more memory.
+Acceptable values are between 50 and 100 percent.  Note that setting the target
+memory locality to 100% might cause numad to continually retry to move memory
+that the kernel will never successfully move.
+.TP
+\fB\-p\fR <\fIPID\fP>
+Add PID to explicit inclusion list of processes to consider for managing.
+Multiple \fI\-p PID\fP options
+can be specified at daemon start, but after daemon start, only one PID can be
+added to the inclusion list per subsequent numad invocation.  Use with \-S to
+precisely control the scope of processes numad can manage.  Explicitly included
+PIDs are always tracked and are considered manageable regardless of the legacy
+CPU and RSS admission thresholds.  This is useful for low-CPU GPU workloads and
+for manual pinning workflows.
+.TP
+\fB\-r\fR <\fIPID\fP>
+Remove PID from both the explicit inclusion and the exclusion lists of
+processes.  After daemon start, only one PID can be removed from the explicit
+process lists per subsequent numad invocation.  Use with \-S and \-p and \-x to
+precisely control the scope of processes numad can manage.
+.TP
+\fB\-R\fR <\fICPU_LIST\fP>
+Specify a list of CPUs that numad should assume are reserved for non-numad use.
+No processes will be bound to the specified CPUs by numad.  This option is
+effective only when starting numad.  You cannot change reserved CPUs
+dynamically while numad is already running.
+.TP
+\fB\-S\fR <\fI0|1\fP>
+This option controls whether numad scans all system processes or only the
+processes on the explicit inclusion PID list.  The default is to scan all
+processes.  Use \fI\-S 0\fP to scan only the explicit inclusion PID list.  Use
+\fI\-S 1\fP to again scan all system processes (excepting those on the explicit
+exclusion list).  Starting numad as
+.br
+\fInumad \-S 0 \-p <PID-1> \-p <PID-2> \-p <PID-3>\fP
+.br
+will limit scanning, and thus also automatic NUMA management, to only those
+three explicitly specified processes.
+.TP
+\fB\-t\fR  <\fIlogical_CPU_percent\fP>
+Specify the resource value of logical CPUs.  Hardware threads typically share
+most core resources, and so logical CPUs add only a fraction of CPU power for
+many workloads.  By default numad considers logical CPUs to be only 20 percent
+of a dedicated hardware core.
+.TP
+\fB\-u\fR  <\fItarget_utilization\fP>
+Set the desired maximum consumption percentage of a node. Default is 85%.
+Decrease the target value to maintain more available resource margin on each
+node.  Increase the target value to more exhaustively consume node resources.
+If you have sized your workloads to precisely fit inside a NUMA node,
+specifying (\fI\-u 100\fP) might improve system performance by telling numad to
+go ahead and consume all the resources in each node.  It is possible to specify
+values up to 130 percent to oversubscribe CPUs in the nodes, but memory
+utilization is always capped at 100%.  Use oversubscription values very
+carefully.
+.TP
+\fB\-v\fR
+Verbose output in log, sets the log level to LOG_INFO.  Same effect as \fI\-l 6\fP.
+.TP
+\fB\-V\fR
+Display version information and exit.
+.TP
+\fB\-w\fR <\fINCPUS[:MB]\fP>
+Queries numad for the best NUMA nodes to bind an entity that needs
+<\fINCPUS\fP>.  The amount of memory (in MBs) is optional, but should normally
+be specified as well <\fI:MB\fP> so numad can recommend NUMA nodes with
+available CPU capacity and adequate free memory.  This query option can be used
+regardless of whether numad is running as a daemon.  (An invocation using this
+option when numad is not running as a daemon, will not cause the daemon to
+start.) Output of this option is a string that contains a NUMA node list.  For
+example: 2\-3,6.  The recommended node list could be saved in a shell variable
+(e.g., NODES) and then used as the node list parameter in a
+.br
+\fInumactl \-m $NODES \-N $NODES ... \fP
+.br
+command.  See numactl(8).
+.TP
+\fB\-x\fR <\fIPID\fP>
+Add PID to explicit exclusion list of processes to blacklist from managing.
+Multiple \fI\-x PID\fP options can be specified at daemon start, but after
+daemon start, only one PID can be added to the exclusion list per subsequent
+numad invocation.  Use with \-S to precisely control the scope of processes
+numad can manage.
+.SH "GPU AWARE OPTIONS"
+.TP
+\fB\-\-gpu-aware\fR=\fI0|1\fP
+Enable or disable AMD GPU-aware process tracking.  The current implementation
+uses DRM fdinfo process telemetry and sysfs topology data while preserving the
+legacy CPU-only path for processes without GPU activity.
+.TP
+\fB\-\-gpu-backend\fR=\fIauto|fdinfo|amdsmi\fP
+Select the GPU telemetry backend.  The current production path uses DRM fdinfo.
+Requesting \fIamdsmi\fP currently emits a warning and falls back to the fdinfo
+collector; the AMD SMI process collector is not implemented yet.
+.TP
+\fB\-\-gpu-min-busy\fR=\fIPCT\fP
+Minimum GPU engine busy percentage required for automatic GPU-driven management.
+.TP
+\fB\-\-gpu-min-vram\fR=\fIMB\fP
+Minimum VRAM footprint in MB required for automatic GPU-driven management.
+.TP
+\fB\-\-gpu-fdinfo-discovery\fR=\fISECONDS\fP
+Interval in seconds between full DRM fdinfo discovery passes.
+.TP
+\fB\-\-gpu-migrate\fR=\fIauto|always|never\fP
+Controls whether numad migrates memory for GPU-active workloads.  In auto mode,
+graphics-oriented GPU processes avoid aggressive memory migration.
+.TP
+\fB\-\-gpu-migrate-busy-max\fR=\fIPCT\fP
+Upper GPU busy threshold for automatic memory migration in \fIauto\fP mode.
+.TP
+\fB\-\-scx-mode\fR=\fIlegacy|cooperate|observe\fP
+Select how numad cooperates with sched_ext.  In cooperate mode, numad narrows
+the allowed CPU mask and leaves in-domain CPU choice to the active scheduler.
+In observe mode, numad only logs what it would have changed.
+.TP
+\fB\-\-scx-sched\fR=\fIauto|beerland|p2dq\fP
+Optional advisory hint for the expected sched_ext scheduler profile.
+.TP
+\fB\-\-bind-cooldown\fR=\fISECONDS\fP
+Minimum delay between repeated rebinding attempts for the same process.
+.LP
+The GPU/SCX long options and \fB\-\-bind-cooldown\fR are startup-only.  When a
+numad daemon is already running, these options must be changed in
+\fI/etc/numad.conf\fP and applied by restarting the service.
+.SH "AMD GPU AWARE OPERATION"
+.LP
+When GPU-aware mode is enabled, numad augments CPU and RSS based placement with
+AMD GPU telemetry gathered from DRM fdinfo and GPU topology data from sysfs.
+The fdinfo backend is the currently implemented process telemetry path.
+Processes without GPU activity continue to use the legacy CPU and memory based
+placement path.  The \fIamdsmi\fP backend option is reserved for future work and
+currently falls back to the fdinfo collector.
+.SH "SCHED_EXT COMPATIBILITY"
+.LP
+numad never starts or stops a sched_ext scheduler automatically.  numad only
+detects whether sched_ext is enabled and which scheduler is active, and then
+cooperates by constraining task CPU affinity masks.
+.LP
+Observe mode is a dry-run mode that records placement decisions without
+rebinding tasks.  The current \fIlegacy\fP and \fIcooperate\fP modes are both
+affinity-driven modes; cooperate narrows the allowed CPU mask and leaves CPU
+selection inside that mask to the active sched_ext scheduler.
+.LP
+The \fB\-\-scx-sched\fR option is currently an advisory and diagnostic knob.  It
+does not start a scheduler, does not stop a scheduler, and is not a mandatory
+selector for scheduler-specific policy branching.
+.SH "RECOMMENDED SCX SCHEDULERS"
+.LP
+scx_beerland is the recommended default for locality-first NUMA servers.
+scx_p2dq is the recommended alternative when broader LLC/NUMA balancing is
+desired.
+.LP
+The following schedulers are not recommended for this locality-first NUMA use
+case: scx_lavd, scx_bpfland, scx_rustland, and scx_flash.  scx_rusty is not
+recommended as the primary choice on multi-socket NUMA systems.  scx_tickless
+remains experimental and is not the primary recommendation here.
+.SH "FILES"
+.LP
+\fI/usr/bin/numad\fP
+.br
+\fI/usr/libexec/numad-wrapper\fP
+.br
+\fI/etc/numad.conf\fP
+.br
+\fI/var/log/numad.log\fP
+.br
+\fI/var/run/numad.pid\fP
+.SH "ENVIRONMENT VARIABLES"
+.LP
+.TP
+None.
+.SH "EXAMPLES"
+.LP
+Numad can be run as a system daemon and can be managed by the
+standard init mechanisms of the host.
+.LP
+If interactive (manual) control is desired, you can start the daemon manually by typing:
+.LP
+/usr/bin/numad
+.LP
+Subsequent numad invocations while the daemon is running can be used to dynamically change most run-time options.
+.LP
+You can terminate numad from running by typing:
+.LP
+/usr/bin/numad -i0
+.SH "AUTHORS"
+.LP
+Bill Gray <bgray@redhat.com>
+.SH "SEE ALSO"
+.LP
+numactl(8)
