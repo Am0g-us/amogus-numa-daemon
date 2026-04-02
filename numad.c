@@ -1404,7 +1404,9 @@ static uint64_t process_effective_magnitude_now(const process_data_p p, uint64_t
 
 // Hash table size must always be a power of two
 #define MIN_PROCESS_HASH_TABLE_SIZE 32
+#define PROCESS_HASH_INSERT_RETRY_ATTEMPTS 3
 int process_hash_table_size = 0;
+int process_hash_table_used = 0;
 int process_hash_collisions = 0;
 process_data_p process_hash_table = NULL;
 
@@ -1417,6 +1419,7 @@ int process_hash_ix(int pid) {
 }
 
 int process_hash_remove(int pid);
+void process_hash_table_expand();
 
 int process_hash_lookup(int pid) {
     int ix = process_hash_ix(pid);
@@ -1437,7 +1440,7 @@ int process_hash_lookup(int pid) {
     return -1;
 }
 
-int process_hash_insert(int pid) {
+static int process_hash_insert_nolog(int pid) {
     // This reserves the hash table slot, but initializes only the pid field
     int ix = process_hash_ix(pid);
     int starting_ix = ix;
@@ -1449,27 +1452,57 @@ int process_hash_insert(int pid) {
         ix += 1;
         ix &= (process_hash_table_size - 1);
         if (ix == starting_ix) {
-            // This "should never happen"...
-            numad_log(LOG_ERR, "Process hash table is full\n");
             return -1;
         }
     }
     process_hash_table[ix].pid = pid;
+    process_hash_table_used += 1;
     return ix;
+}
+
+
+int process_hash_insert(int pid) {
+    int ix = process_hash_insert_nolog(pid);
+    if (ix < 0) {
+        numad_log(LOG_ERR, "Process hash table is full\n");
+    }
+    return ix;
+}
+
+
+static int process_hash_insert_with_retry(int pid) {
+    if ((process_hash_table_size <= 0) || (process_hash_table == NULL)) {
+        process_hash_table_expand();
+    }
+
+    for (int attempt = 0;  (attempt < PROCESS_HASH_INSERT_RETRY_ATTEMPTS);  attempt++) {
+        int ix = process_hash_insert_nolog(pid);
+        if (ix >= 0) {
+            return ix;
+        }
+        if (attempt + 1 < PROCESS_HASH_INSERT_RETRY_ATTEMPTS) {
+            process_hash_table_expand();
+        }
+    }
+
+    numad_log(LOG_ERR,
+              "Process hash table insert failed for PID %d even after expand\n",
+              pid);
+    return -1;
 }
 
 int process_hash_update(process_data_p newp) {
     // This updates hash table stats for processes we are monitoring. Only the
     // scalar resource consumption stats need to be updated here.
     int new_hash_table_entry = 1;
-    int ix = process_hash_insert(newp->pid);
+    int ix = process_hash_insert_with_retry(newp->pid);
     if (ix >= 0) {
         process_data_p p = &process_hash_table[ix];
         if ((p->data_time_stamp > 0) && (p->start_time_ticks > 0)
             && (newp->start_time_ticks > 0)
             && (p->start_time_ticks != newp->start_time_ticks)) {
             process_hash_remove(p->pid);
-            ix = process_hash_insert(newp->pid);
+            ix = process_hash_insert_with_retry(newp->pid);
             if (ix < 0) {
                 return 0;
             }
@@ -1612,12 +1645,13 @@ int process_hash_rehash(int old_ix) {
     // Given the index of a table entry that would otherwise be orphaned by
     // process_hash_remove(), reinsert into table using PID from existing record.
     process_data_p op = &process_hash_table[old_ix];
-    int new_ix = process_hash_insert(op->pid);
+    int new_ix = process_hash_insert_nolog(op->pid);
     if (new_ix >= 0) {
         // Copy old slot to new slot, and zero old slot
         process_data_p np = &process_hash_table[new_ix];
         memcpy(np, op, sizeof(process_data_t));
         memset(op,  0, sizeof(process_data_t));
+        process_hash_table_used -= 1;
     }
     return new_ix;
 }
@@ -1631,6 +1665,7 @@ int process_hash_remove(int pid) {
         FREE_LIST(dp->node_list_p);
         FREE_LIST(dp->gpu_list_p);
         memset(dp, 0, sizeof(process_data_t));
+        process_hash_table_used -= 1;
         // bubble up the collision chain and rehash if neeeded
         for (;;) {
             ix += 1;
@@ -1666,10 +1701,17 @@ void process_hash_table_expand() {
     }
     // Clear the new table, and copy valid entries from old table
     memset(process_hash_table, 0, process_hash_table_size * sizeof(process_data_t));
+    process_hash_table_used = 0;
     for (int ix = 0;  (ix < old_size);  ix++) {
         process_data_p p = &old_table[ix];
         if (p->pid) {
-            int new_table_ix = process_hash_insert(p->pid);
+            int new_table_ix = process_hash_insert_nolog(p->pid);
+            if (new_table_ix < 0) {
+                numad_log(LOG_CRIT,
+                          "Process hash table reinsert failed during expand for PID %d\n",
+                          p->pid);
+                exit(EXIT_FAILURE);
+            }
             memcpy(&process_hash_table[new_table_ix], p, sizeof(process_data_t));
         }
     }
@@ -1679,34 +1721,21 @@ void process_hash_table_expand() {
 }
 
 
-static int process_hash_table_entries_used() {
-    int used = 0;
-    for (int ix = 0;  (ix < process_hash_table_size);  ix++) {
-        if (process_hash_table[ix].pid) {
-            used += 1;
-        }
-    }
-    return used;
-}
-
-
 static void process_hash_table_ensure_free_slots(int min_free_slots) {
     if (min_free_slots < 1) {
         min_free_slots = 1;
     }
     while ((process_hash_table_size <= 0)
-           || ((process_hash_table_size - process_hash_table_entries_used()) < min_free_slots)) {
+           || ((process_hash_table_size - process_hash_table_used) < min_free_slots)) {
         process_hash_table_expand();
     }
 }
 
 
 void process_hash_table_cleanup(uint64_t update_time) {
-    int num_hash_entries_used = 0;
     for (int ix = 0;  (ix < process_hash_table_size);  ix++) {
         process_data_p p = &process_hash_table[ix];
         if (p->pid) {
-            num_hash_entries_used += 1;
             if (p->data_time_stamp < update_time) {
                 // Mark as old, and zero CPU utilization
                 p->data_time_stamp = 0;
@@ -1718,13 +1747,12 @@ void process_hash_table_cleanup(uint64_t update_time) {
                 if ((kill(p->pid, 0) == -1) && (errno == ESRCH)) {
                     // Seems dead.  Forget this pid
                     process_hash_remove(p->pid);
-                    num_hash_entries_used -= 1;
                 }
             }
         }
     }
     // Keep hash table approximately half empty
-    if ((num_hash_entries_used * 7) / 4 > process_hash_table_size) {
+    if ((process_hash_table_used * 7) / 4 > process_hash_table_size) {
         process_hash_table_expand();
     }
 }
