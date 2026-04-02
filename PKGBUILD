@@ -4,7 +4,7 @@
 # Contributor: amogus <amogussugomus AT proton DOT me>
 
 pkgname=amogus-numa-daemon-git
-pkgver=r0.0
+pkgver=r8.gdaefcf8
 pkgrel=1
 pkgdesc="NUMA daemon with GPU-aware locality management and sched_ext-compatible cooperative behavior (amogus experimental fork)"
 arch=('x86_64')
