@@ -4312,9 +4312,15 @@ int manage_loads() {
                 }
         }
 
+        int current_drifted_from_last_target = ((p->node_list_p != NULL)
+                                                && (NUM_IDS_IN_LIST(p->node_list_p) > 0)
+                                                && (p->last_bound_node_list_p != NULL)
+                                                && (NUM_IDS_IN_LIST(p->last_bound_node_list_p) > 0)
+                                                && !EQUAL_LISTS(p->node_list_p, p->last_bound_node_list_p));
+
         // If this process was recently bound, enforce a minimum delay
         // between repeated attempts to potentially move the process.
-        if ((!quick_turn_around) && (!boosted)
+        if ((!quick_turn_around) && (!boosted) && (!current_drifted_from_last_target)
             && (p->bind_time_stamp + ((uint64_t)bind_cooldown_sec * ONE_HUNDRED) > time_stamp)) {
             // Skip re-evaluation because we just did it recently,
             if (log_level >= LOG_DEBUG) {
@@ -4345,10 +4351,16 @@ int manage_loads() {
         // check return value same as p->node_list_p
         int rc = 0;
         if ((node_list_p != NULL) && (NUM_IDS_IN_LIST(node_list_p) > 0)) {
-            if ((p->last_bound_node_list_p != NULL)
-                && (NUM_IDS_IN_LIST(p->last_bound_node_list_p) > 0)
-                && EQUAL_LISTS(node_list_p, p->last_bound_node_list_p)
-                && (p->bind_time_stamp + ((uint64_t)bind_cooldown_sec * ONE_HUNDRED) > time_stamp)) {
+            int same_target_within_cooldown = ((p->last_bound_node_list_p != NULL)
+                                               && (NUM_IDS_IN_LIST(p->last_bound_node_list_p) > 0)
+                                               && EQUAL_LISTS(node_list_p, p->last_bound_node_list_p)
+                                               && (p->bind_time_stamp + ((uint64_t)bind_cooldown_sec * ONE_HUNDRED) > time_stamp));
+            int current_matches_last_bound = ((current_node_list_p != NULL)
+                                             && (NUM_IDS_IN_LIST(current_node_list_p) > 0)
+                                             && (p->last_bound_node_list_p != NULL)
+                                             && (NUM_IDS_IN_LIST(p->last_bound_node_list_p) > 0)
+                                             && EQUAL_LISTS(current_node_list_p, p->last_bound_node_list_p));
+            if (same_target_within_cooldown && current_matches_last_bound) {
                 if (log_level >= LOG_DEBUG) {
                     char target_buf[BUF_SIZE];
                     str_from_node_ix_list_as_node_ids(target_buf, BUF_SIZE, node_list_p);
@@ -4357,6 +4369,16 @@ int manage_loads() {
                               p->pid, process_comm_name(p), target_buf);
                 }
                 COPY_LIST(current_node_list_p, p->node_list_p);
+            } else if (same_target_within_cooldown && !current_matches_last_bound) {
+                if (log_level >= LOG_DEBUG) {
+                    char current_buf[BUF_SIZE];
+                    char target_buf[BUF_SIZE];
+                    str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
+                    str_from_node_ix_list_as_node_ids(target_buf, BUF_SIZE, node_list_p);
+                    numad_log(LOG_DEBUG,
+                              "PID %d %s current affinity drifted from last successful target; reapplying node(s) (%s) from current node(s) (%s) despite cooldown.\n",
+                              p->pid, process_comm_name(p), target_buf, current_buf);
+                }
             } else if (scx_mode == SCX_MODE_OBSERVE) {
                 numad_log(LOG_NOTICE, "SCX observe mode: PID %d would be rebound now\n", p->pid);
                 COPY_LIST(current_node_list_p, p->node_list_p);
