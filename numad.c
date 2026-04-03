@@ -93,6 +93,7 @@ Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 #define DEFAULT_GPU_MIGRATE_BUSY_MAX 20
 #define DEFAULT_GPU_GRAPHICS_PLACEMENT 0
 #define DEFAULT_BIND_COOLDOWN_SEC 300
+#define REBIND_HYSTERESIS_MIN_IMPROVEMENT_PCT 10
 
 #define PROC_COMM_SIZE 256
 #define GPU_BDF_SIZE 32
@@ -326,6 +327,7 @@ extern int *node_ix_by_id;
 extern int max_node_id_seen;
 extern int *cpu_to_node_ix;
 extern id_list_p reserved_cpu_mask_list_p;
+extern id_list_p all_nodes_list_p;
 extern pid_list_p include_pid_list;
 extern pid_list_p exclude_pid_list;
 
@@ -806,6 +808,12 @@ typedef enum {
 } gpu_graphics_placement_t;
 
 typedef enum {
+    GPU_TOPOLOGY_NONE = 0,
+    GPU_TOPOLOGY_NUMA_NODE,
+    GPU_TOPOLOGY_LOCAL_CPULIST,
+} gpu_topology_source_t;
+
+typedef enum {
     SCX_MODE_LEGACY = 0,
     SCX_MODE_COOPERATE,
     SCX_MODE_OBSERVE,
@@ -825,6 +833,8 @@ typedef struct gpu_device {
     int numa_node_id;
     int numa_node_ix;
     id_list_p local_cpu_list_p;
+    id_list_p local_node_list_p;
+    gpu_topology_source_t topology_source;
     int valid;
 } gpu_device_t, *gpu_device_p;
 
@@ -855,6 +865,8 @@ struct process_data {
     char comm[PROC_COMM_SIZE];
     id_list_p node_list_p;
     id_list_p last_bound_node_list_p;
+    id_list_p prev_bound_node_list_p;
+    uint64_t last_cross_node_move_ts;
     uint64_t *process_MBs;
     uint64_t gpu_vram_mb;
     uint32_t gpu_busy_pct;
@@ -889,6 +901,86 @@ static int drm_card_and_digits(const struct dirent *dptr) {
         }
     }
     return 1;
+}
+
+static const char *gpu_topology_source_str(gpu_topology_source_t src) {
+    switch (src) {
+    case GPU_TOPOLOGY_NUMA_NODE:
+        return "numa_node";
+    case GPU_TOPOLOGY_LOCAL_CPULIST:
+        return "local_cpulist";
+    case GPU_TOPOLOGY_NONE:
+    default:
+        return "none";
+    }
+}
+
+static int cpu_lists_intersect(id_list_p list_a_p, id_list_p list_b_p) {
+    static id_list_p intersection_p = NULL;
+
+    if ((list_a_p == NULL) || (list_b_p == NULL)) {
+        return 0;
+    }
+    CLEAR_CPU_LIST(intersection_p);
+    AND_LISTS(intersection_p, list_a_p, list_b_p);
+    return (NUM_IDS_IN_LIST(intersection_p) > 0);
+}
+
+static void build_node_list_from_cpu_list(id_list_p cpu_list_p, id_list_p out_node_list_p) {
+    CLEAR_NODE_LIST(out_node_list_p);
+
+    if ((cpu_list_p == NULL) || (NUM_IDS_IN_LIST(cpu_list_p) == 0)) {
+        return;
+    }
+    for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
+        if ((node[node_ix].cpu_list_p != NULL)
+            && cpu_lists_intersect(cpu_list_p, node[node_ix].cpu_list_p)) {
+            ADD_ID_TO_LIST(node_ix, out_node_list_p);
+        }
+    }
+}
+
+static int gpu_has_resolved_local_nodes(const gpu_device_p g) {
+    return ((g != NULL)
+            && (g->local_node_list_p != NULL)
+            && (NUM_IDS_IN_LIST(g->local_node_list_p) > 0));
+}
+
+static void resolve_gpu_local_nodes(gpu_device_p g) {
+    if (g == NULL) {
+        return;
+    }
+
+    CLEAR_NODE_LIST(g->local_node_list_p);
+    g->topology_source = GPU_TOPOLOGY_NONE;
+
+    if (g->numa_node_ix >= 0) {
+        ADD_ID_TO_LIST(g->numa_node_ix, g->local_node_list_p);
+        g->topology_source = GPU_TOPOLOGY_NUMA_NODE;
+    }
+
+    if ((g->local_cpu_list_p != NULL) && (NUM_IDS_IN_LIST(g->local_cpu_list_p) > 0)) {
+        static id_list_p inferred_node_list_p = NULL;
+        build_node_list_from_cpu_list(g->local_cpu_list_p, inferred_node_list_p);
+        if (NUM_IDS_IN_LIST(inferred_node_list_p) > 0) {
+            if (g->topology_source == GPU_TOPOLOGY_NONE) {
+                COPY_LIST(inferred_node_list_p, g->local_node_list_p);
+                g->topology_source = GPU_TOPOLOGY_LOCAL_CPULIST;
+            } else if (!EQUAL_LISTS(inferred_node_list_p, g->local_node_list_p)) {
+                char explicit_nodes[BUF_SIZE];
+                char inferred_nodes[BUF_SIZE];
+                str_from_node_ix_list_as_node_ids(explicit_nodes, sizeof(explicit_nodes), g->local_node_list_p);
+                str_from_node_ix_list_as_node_ids(inferred_nodes, sizeof(inferred_nodes), inferred_node_list_p);
+                numad_log(LOG_DEBUG,
+                          "AMD GPU %s pci=%s explicit numa_node=%d resolved to node(s) (%s), but local_cpulist infers node(s) (%s); keeping explicit numa_node result\n",
+                          g->drm_name,
+                          (g->pci_bdf[0] != '\0') ? g->pci_bdf : "(unknown)",
+                          g->numa_node_id,
+                          explicit_nodes,
+                          inferred_nodes);
+            }
+        }
+    }
 }
 
 static int read_int_file(const char *path, int *value) {
@@ -1134,6 +1226,7 @@ static int find_or_add_fdinfo_client(fdinfo_client_acc_t *acc, int cap,
 static int discover_amdgpu_devices_from_sysfs(void) {
     for (int ix = 0; ix < gpu_count; ix++) {
         FREE_LIST(gpu[ix].local_cpu_list_p);
+        FREE_LIST(gpu[ix].local_node_list_p);
     }
     free(gpu);
     gpu = NULL;
@@ -1185,12 +1278,28 @@ static int discover_amdgpu_devices_from_sysfs(void) {
         }
 
         g->valid = 1;
+        resolve_gpu_local_nodes(g);
+        char local_nodes[BUF_SIZE];
+        char local_cpus[BUF_SIZE];
+        if (gpu_has_resolved_local_nodes(g)) {
+            str_from_node_ix_list_as_node_ids(local_nodes, sizeof(local_nodes), g->local_node_list_p);
+        } else {
+            snprintf(local_nodes, sizeof(local_nodes), "none");
+        }
+        if ((g->local_cpu_list_p != NULL) && (NUM_IDS_IN_LIST(g->local_cpu_list_p) > 0)) {
+            str_from_id_list(local_cpus, sizeof(local_cpus), g->local_cpu_list_p);
+        } else {
+            snprintf(local_cpus, sizeof(local_cpus), "none");
+        }
         numad_log(LOG_DEBUG,
-                  "Discovered AMD GPU %s pci=%s numa_node=%d numa_node_ix=%d\n",
+                  "Discovered AMD GPU %s pci=%s numa_node=%d numa_node_ix=%d topology=%s local_nodes=(%s) local_cpus=(%s)\n",
                   g->drm_name,
                   (g->pci_bdf[0] != '\0') ? g->pci_bdf : "(unknown)",
                   g->numa_node_id,
-                  g->numa_node_ix);
+                  g->numa_node_ix,
+                  gpu_topology_source_str(g->topology_source),
+                  local_nodes,
+                  local_cpus);
         gpu_count += 1;
         free(namelist[ix]);
     }
@@ -1829,8 +1938,153 @@ static void remember_last_bound_target(process_data_p p) {
     if ((p == NULL) || (p->node_list_p == NULL) || (NUM_IDS_IN_LIST(p->node_list_p) == 0)) {
         return;
     }
+}
+
+static void remember_last_bound_target_with_history(process_data_p p,
+                                                    id_list_p previous_node_list_p,
+                                                    uint64_t bind_ts) {
+    if ((p == NULL) || (p->node_list_p == NULL) || (NUM_IDS_IN_LIST(p->node_list_p) == 0)) {
+        return;
+    }
+    if ((previous_node_list_p != NULL)
+        && (NUM_IDS_IN_LIST(previous_node_list_p) > 0)
+        && !EQUAL_LISTS(previous_node_list_p, p->node_list_p)) {
+        CLEAR_NODE_LIST(p->prev_bound_node_list_p);
+        COPY_LIST(previous_node_list_p, p->prev_bound_node_list_p);
+        p->last_cross_node_move_ts = bind_ts;
+    }
     CLEAR_NODE_LIST(p->last_bound_node_list_p);
     COPY_LIST(p->node_list_p, p->last_bound_node_list_p);
+}
+
+static int node_list_is_subset_of(id_list_p subset_p, id_list_p superset_p) {
+    static id_list_p tmp_p = NULL;
+
+    if ((subset_p == NULL) || (NUM_IDS_IN_LIST(subset_p) == 0)) {
+        return 1;
+    }
+    if (superset_p == NULL) {
+        return 0;
+    }
+    CLEAR_NODE_LIST(tmp_p);
+    AND_LISTS(tmp_p, subset_p, superset_p);
+    return (NUM_IDS_IN_LIST(tmp_p) == NUM_IDS_IN_LIST(subset_p));
+}
+
+static int estimate_nonlocal_percent_for_target(const process_data_p p, id_list_p target_node_list_p) {
+    if ((p == NULL) || (target_node_list_p == NULL) || (p->process_MBs == NULL) || (p->MBs_used == 0)) {
+        return 0;
+    }
+
+    uint64_t nonlocal_memory = 0;
+    for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
+        if (!ID_IS_IN_LIST(node_ix, target_node_list_p)) {
+            nonlocal_memory += p->process_MBs[node_ix];
+        }
+    }
+    return (int)((100 * nonlocal_memory) / MAX(p->MBs_used, 1));
+}
+
+static int target_has_enough_headroom(id_list_p target_node_list_p, int cpu_request, int mb_request) {
+    if ((target_node_list_p == NULL) || (NUM_IDS_IN_LIST(target_node_list_p) == 0)) {
+        return 0;
+    }
+
+    uint64_t cpus_free = 0;
+    uint64_t mbs_free = 0;
+    for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
+        if (ID_IS_IN_LIST(node_ix, target_node_list_p)) {
+            cpus_free += node[node_ix].CPUs_free;
+            mbs_free += node[node_ix].MBs_free;
+        }
+    }
+    return ((cpus_free + CPU_THRESHOLD >= (uint64_t)MAX(cpu_request, 0))
+            && (mbs_free + MEMORY_THRESHOLD >= (uint64_t)MAX(mb_request, 0)));
+}
+
+static int should_suppress_rebind(const process_data_p p,
+                                  id_list_p current_node_list_p,
+                                  id_list_p candidate_node_list_p,
+                                  id_list_p gpu_preferred_nodes_p,
+                                  int cpu_request,
+                                  int mb_request,
+                                  uint64_t now,
+                                  char *reason_buf,
+                                  size_t reason_buf_size) {
+#define SET_SUPPRESS_REASON(fmt, ...) \
+    do { \
+        if ((reason_buf != NULL) && (reason_buf_size > 0)) { \
+            snprintf(reason_buf, reason_buf_size, fmt, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
+    if ((reason_buf != NULL) && (reason_buf_size > 0)) {
+        reason_buf[0] = '\0';
+    }
+    if ((p == NULL)
+        || (current_node_list_p == NULL)
+        || (candidate_node_list_p == NULL)
+        || (NUM_IDS_IN_LIST(candidate_node_list_p) == 0)
+        || (p->bind_time_stamp == 0)
+        || (NUM_IDS_IN_LIST(current_node_list_p) == 0)
+        || EQUAL_LISTS(current_node_list_p, candidate_node_list_p)
+        || EQUAL_LISTS(current_node_list_p, all_nodes_list_p)) {
+        return 0;
+    }
+
+    int gpu_active = ((p->flags & PROCESS_FLAG_GPU_ACTIVE) != 0)
+                     && (p->gpu_list_p != NULL)
+                     && (NUM_IDS_IN_LIST(p->gpu_list_p) > 0);
+    int gpu_preferred_resolved = (gpu_preferred_nodes_p != NULL)
+                                 && (NUM_IDS_IN_LIST(gpu_preferred_nodes_p) > 0);
+    int current_in_gpu_preferred = gpu_preferred_resolved
+                                   && node_list_is_subset_of(current_node_list_p, gpu_preferred_nodes_p);
+    int candidate_in_gpu_preferred = gpu_preferred_resolved
+                                     && node_list_is_subset_of(candidate_node_list_p, gpu_preferred_nodes_p);
+    int current_has_headroom = target_has_enough_headroom(current_node_list_p, cpu_request, mb_request);
+    int current_nonlocal = estimate_nonlocal_percent_for_target(p, current_node_list_p);
+    int candidate_nonlocal = estimate_nonlocal_percent_for_target(p, candidate_node_list_p);
+    int locality_improvement = current_nonlocal - candidate_nonlocal;
+
+    if ((p->prev_bound_node_list_p != NULL)
+        && (NUM_IDS_IN_LIST(p->prev_bound_node_list_p) > 0)
+        && EQUAL_LISTS(candidate_node_list_p, p->prev_bound_node_list_p)
+        && (p->last_cross_node_move_ts > 0)
+        && (p->last_cross_node_move_ts + ((uint64_t)bind_cooldown_sec * ONE_HUNDRED) > now)) {
+        SET_SUPPRESS_REASON("anti-ping-pong cooldown after recent cross-node move");
+        return 1;
+    }
+    if (!current_has_headroom) {
+        return 0;
+    }
+    if (gpu_active && !gpu_preferred_resolved) {
+        SET_SUPPRESS_REASON("GPU topology is unresolved and current node(s) still satisfy the request");
+        return 1;
+    }
+    if (gpu_active && current_in_gpu_preferred && !candidate_in_gpu_preferred) {
+        SET_SUPPRESS_REASON("current binding already satisfies GPU-local preference");
+        return 1;
+    }
+    if (gpu_active && !current_in_gpu_preferred && candidate_in_gpu_preferred) {
+        return 0;
+    }
+    if (gpu_active && current_in_gpu_preferred && candidate_in_gpu_preferred
+        && (locality_improvement < REBIND_HYSTERESIS_MIN_IMPROVEMENT_PCT)) {
+        SET_SUPPRESS_REASON("current node(s) are already within GPU-local preference and locality gain is below hysteresis");
+        return 1;
+    }
+    if (locality_improvement <= 0) {
+        SET_SUPPRESS_REASON("candidate offers no memory-locality gain while current node(s) still satisfy the request");
+        return 1;
+    }
+    if (locality_improvement < REBIND_HYSTERESIS_MIN_IMPROVEMENT_PCT) {
+        SET_SUPPRESS_REASON("memory-locality improvement %d%% is below hysteresis threshold %d%%",
+                            locality_improvement, REBIND_HYSTERESIS_MIN_IMPROVEMENT_PCT);
+        return 1;
+    }
+    return 0;
+
+#undef SET_SUPPRESS_REASON
 }
 
 static id_list_p build_target_cpu_mask(const process_data_p p, id_list_p out) {
@@ -1883,6 +2137,7 @@ static id_list_p build_target_cpu_mask(const process_data_p p, id_list_p out) {
 void process_hash_clear_all_bind_time_stamps() {
     for (int ix = 0;  (ix < process_hash_table_size);  ix++) {
         process_hash_table[ix].bind_time_stamp = 0;
+        process_hash_table[ix].last_cross_node_move_ts = 0;
     }
 }
 
@@ -1909,6 +2164,7 @@ int process_hash_remove(int pid) {
         if (dp->process_MBs) { free(dp->process_MBs); }
         FREE_LIST(dp->node_list_p);
         FREE_LIST(dp->last_bound_node_list_p);
+        FREE_LIST(dp->prev_bound_node_list_p);
         FREE_LIST(dp->gpu_list_p);
         memset(dp, 0, sizeof(process_data_t));
         process_hash_table_used -= 1;
@@ -2502,6 +2758,79 @@ void show_nodes(int nodes) {
     fflush(log_fs);
 }
 
+static void log_numa_topology_snapshot(void) {
+    uint64_t total_mbs = 0;
+    uint64_t total_cpus = 0;
+    for (int ix = 0; ix < num_nodes; ix++) {
+        total_mbs += node[ix].MBs_total;
+        total_cpus += node[ix].CPUs_total;
+    }
+    numad_log(LOG_NOTICE, "Startup NUMA topology: nodes=%d cpus=%d total_mbs=%llu total_cpus=%llu\n",
+              num_nodes, num_cpus,
+              (unsigned long long)total_mbs,
+              (unsigned long long)total_cpus);
+    for (int ix = 0; ix < num_nodes; ix++) {
+        char cpu_buf[BUF_SIZE];
+        char dist_buf[BUF_SIZE];
+        str_from_id_list(cpu_buf, sizeof(cpu_buf), node[ix].cpu_list_p);
+        char *p = dist_buf;
+        size_t remaining = sizeof(dist_buf);
+        for (int d = 0; d < num_nodes; d++) {
+            int written = snprintf(p, remaining, "%s%d", (d > 0) ? " " : "", node[ix].distance[d]);
+            if ((written < 0) || ((size_t)written >= remaining)) {
+                break;
+            }
+            p += written;
+            remaining -= (size_t)written;
+        }
+        numad_log(LOG_NOTICE,
+                  "Startup node[%d] id=%ld cpus=(%s) mem_total=%ldMB mem_free=%ldMB cpus_total=%ld cpus_free=%ld dist=(%s)\n",
+                  ix, node[ix].node_id, cpu_buf,
+                  node[ix].MBs_total, node[ix].MBs_free,
+                  node[ix].CPUs_total, node[ix].CPUs_free,
+                  dist_buf);
+    }
+}
+
+static void log_gpu_topology_snapshot(void) {
+    if (!gpu_aware) {
+        numad_log(LOG_NOTICE, "Startup GPU topology: gpu-aware=0\n");
+        return;
+    }
+
+    numad_log(LOG_NOTICE, "Startup GPU topology: discovered %d AMD GPU(s)\n", gpu_count);
+    for (int g = 0; g < gpu_count; g++) {
+        char local_nodes[BUF_SIZE];
+        char local_cpus[BUF_SIZE];
+        if (gpu_has_resolved_local_nodes(&gpu[g])) {
+            str_from_node_ix_list_as_node_ids(local_nodes, sizeof(local_nodes), gpu[g].local_node_list_p);
+        } else {
+            snprintf(local_nodes, sizeof(local_nodes), "none");
+        }
+        if ((gpu[g].local_cpu_list_p != NULL) && (NUM_IDS_IN_LIST(gpu[g].local_cpu_list_p) > 0)) {
+            str_from_id_list(local_cpus, sizeof(local_cpus), gpu[g].local_cpu_list_p);
+        } else {
+            snprintf(local_cpus, sizeof(local_cpus), "none");
+        }
+        numad_log(LOG_NOTICE,
+                  "Startup GPU[%d] drm=%s pci=%s numa_node=%d numa_node_ix=%d source=%s local_nodes=(%s) local_cpus=(%s)\n",
+                  g,
+                  (gpu[g].drm_name[0] != '\0') ? gpu[g].drm_name : "(unknown)",
+                  (gpu[g].pci_bdf[0] != '\0') ? gpu[g].pci_bdf : "(unknown)",
+                  gpu[g].numa_node_id,
+                  gpu[g].numa_node_ix,
+                  gpu_topology_source_str(gpu[g].topology_source),
+                  local_nodes,
+                  local_cpus);
+    }
+}
+
+static void log_system_topology_snapshot(uint64_t now) {
+    update_gpu_topology_if_needed(now);
+    log_numa_topology_snapshot();
+    log_gpu_topology_snapshot();
+}
+
 
 int update_nodes() {
     char fname[FNAME_SIZE];
@@ -3041,7 +3370,8 @@ static int cmp_ints_by_ref(const void *p1, const void *p2) {
 */
 
 
-int bind_process_and_maybe_migrate_memory(process_data_p p, int migrate_memory, const char *migrate_reason) {
+int bind_process_and_maybe_migrate_memory(process_data_p p, id_list_p previous_node_list_p,
+                                          int migrate_memory, const char *migrate_reason) {
     uint64_t t0 = get_time_stamp();
     // Parameter p is a pointer to an element in the hash table
     if ((!p) || (p->pid < 1)) {
@@ -3217,7 +3547,7 @@ migrate_pages_success:
     } else {
         uint64_t t1 = get_time_stamp();
         p->bind_time_stamp = t1;
-        remember_last_bound_target(p);
+        remember_last_bound_target_with_history(p, previous_node_list_p, t1);
         if (affinity_errors > 0) {
             numad_log(LOG_WARNING, "PID %d affinity target node(s) %s applied with %d task affinity error(s) in %d.%d seconds\n",
                       p->pid, node_list_str, affinity_errors, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
@@ -3257,8 +3587,8 @@ static void build_gpu_preferred_nodes(const process_data_p p, id_list_p out) {
         return;
     }
     for (int g = 0; g < gpu_count; g++) {
-        if (ID_IS_IN_LIST(g, p->gpu_list_p) && (gpu[g].numa_node_ix >= 0)) {
-            ADD_ID_TO_LIST(gpu[g].numa_node_ix, out);
+        if (ID_IS_IN_LIST(g, p->gpu_list_p) && gpu_has_resolved_local_nodes(&gpu[g])) {
+            OR_LISTS(out, out, gpu[g].local_node_list_p);
         }
     }
 }
@@ -3685,7 +4015,7 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
         if (pid > 0) {
             log_gpu_placement_context(p, preferred_nodes_p);
         }
-        if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
+            if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
             char preferred_buf[BUF_SIZE];
             str_from_node_ix_list_as_node_ids(preferred_buf, BUF_SIZE, preferred_nodes_p);
             id_list_p preferred = pick_numa_nodes_core(pid, cpus, mbs,
@@ -3718,8 +4048,7 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
                           gpu_graphics_placement_str(gpu_graphics_placement));
             }
         } else if (pid > 0) {
-            if (process_has_graphics_gpu_context(p)
-                && (p->node_list_p != NULL)
+            if ((p->node_list_p != NULL)
                 && (NUM_IDS_IN_LIST(p->node_list_p) > 0)
                 && (all_nodes_list_p != NULL)
                 && !EQUAL_LISTS(p->node_list_p, all_nodes_list_p)) {
@@ -3999,11 +4328,16 @@ int manage_loads() {
         }
         pthread_mutex_lock(&node_info_mutex);
         static id_list_p current_node_list_p;
+        static id_list_p gpu_preferred_nodes_p;
         CLEAR_NODE_LIST(current_node_list_p);
         if ((p->node_list_p != NULL) && (NUM_IDS_IN_LIST(p->node_list_p) > 0)) {
             COPY_LIST(p->node_list_p, current_node_list_p);
         } else if (all_nodes_list_p != NULL) {
             COPY_LIST(all_nodes_list_p, current_node_list_p);
+        }
+        CLEAR_NODE_LIST(gpu_preferred_nodes_p);
+        if ((p->flags & PROCESS_FLAG_GPU_ACTIVE) && (p->gpu_list_p != NULL)) {
+            build_gpu_preferred_nodes(p, gpu_preferred_nodes_p);
         }
         id_list_p node_list_p = pick_numa_nodes(p->pid, cpu_request, mb_request, assume_enough_cpus);
         // check return value same as p->node_list_p
@@ -4020,24 +4354,41 @@ int manage_loads() {
                               "Skipping repeated same-target rebind for PID %d %s toward node(s) (%s); last successful target is still within cooldown.\n",
                               p->pid, process_comm_name(p), target_buf);
                 }
+                COPY_LIST(current_node_list_p, p->node_list_p);
             } else if (scx_mode == SCX_MODE_OBSERVE) {
                 numad_log(LOG_NOTICE, "SCX observe mode: PID %d would be rebound now\n", p->pid);
+                COPY_LIST(current_node_list_p, p->node_list_p);
             } else {
                 char migrate_reason[BUF_SIZE];
+                char suppress_reason[BUF_SIZE];
                 int migrate_memory = should_migrate_process_memory(p, migrate_reason, sizeof(migrate_reason));
-                if ((NUM_IDS_IN_LIST(current_node_list_p) > 0)
+                if (should_suppress_rebind(p, current_node_list_p, node_list_p,
+                                           gpu_preferred_nodes_p, cpu_request, mb_request,
+                                           time_stamp, suppress_reason, sizeof(suppress_reason))) {
+                    char current_buf[BUF_SIZE];
+                    str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
+                    COPY_LIST(current_node_list_p, p->node_list_p);
+                    p->bind_time_stamp = time_stamp;
+                    remember_last_bound_target_with_history(p, current_node_list_p, time_stamp);
+                    numad_log(LOG_DEBUG,
+                              "PID %d %s move suppressed: %s; keeping current node(s) (%s)\n",
+                              p->pid, process_comm_name(p),
+                              (suppress_reason[0] != '\0') ? suppress_reason : "policy decision",
+                              current_buf);
+                } else if ((NUM_IDS_IN_LIST(current_node_list_p) > 0)
                     && EQUAL_LISTS(node_list_p, current_node_list_p)
                     && !migrate_memory) {
                     char current_buf[BUF_SIZE];
                     str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
                     p->bind_time_stamp = get_time_stamp();
-                    remember_last_bound_target(p);
+                    remember_last_bound_target_with_history(p, current_node_list_p, p->bind_time_stamp);
                     numad_log(LOG_DEBUG,
                               "PID %d %s target node(s) unchanged (%s); keeping current affinity because memory migration is skipped: %s\n",
                               p->pid, process_comm_name(p), current_buf,
                               (migrate_reason[0] != '\0') ? migrate_reason : "policy decision");
                 } else {
-                    rc = bind_process_and_maybe_migrate_memory(p, migrate_memory, migrate_reason);
+                    rc = bind_process_and_maybe_migrate_memory(p, current_node_list_p,
+                                                              migrate_memory, migrate_reason);
                 }
             }
         }
@@ -4650,6 +5001,10 @@ int main(int argc, char *argv[]) {
             exit(EXIT_FAILURE);
         }
 #endif
+        pthread_mutex_lock(&node_info_mutex);
+        update_nodes();
+        log_system_topology_snapshot(get_time_stamp());
+        pthread_mutex_unlock(&node_info_mutex);
         // Loop here forwever...
         for (;;) {
             uint64_t cycle_ts = get_time_stamp();
