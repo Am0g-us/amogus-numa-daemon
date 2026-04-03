@@ -926,11 +926,11 @@ static int cpu_lists_intersect(id_list_p list_a_p, id_list_p list_b_p) {
     return (NUM_IDS_IN_LIST(intersection_p) > 0);
 }
 
-static void build_node_list_from_cpu_list(id_list_p cpu_list_p, id_list_p out_node_list_p) {
+static id_list_p build_node_list_from_cpu_list(id_list_p cpu_list_p, id_list_p out_node_list_p) {
     CLEAR_NODE_LIST(out_node_list_p);
 
     if ((cpu_list_p == NULL) || (NUM_IDS_IN_LIST(cpu_list_p) == 0)) {
-        return;
+        return out_node_list_p;
     }
     for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
         if ((node[node_ix].cpu_list_p != NULL)
@@ -938,6 +938,7 @@ static void build_node_list_from_cpu_list(id_list_p cpu_list_p, id_list_p out_no
             ADD_ID_TO_LIST(node_ix, out_node_list_p);
         }
     }
+    return out_node_list_p;
 }
 
 static int gpu_has_resolved_local_nodes(const gpu_device_p g) {
@@ -961,7 +962,7 @@ static void resolve_gpu_local_nodes(gpu_device_p g) {
 
     if ((g->local_cpu_list_p != NULL) && (NUM_IDS_IN_LIST(g->local_cpu_list_p) > 0)) {
         static id_list_p inferred_node_list_p = NULL;
-        build_node_list_from_cpu_list(g->local_cpu_list_p, inferred_node_list_p);
+        inferred_node_list_p = build_node_list_from_cpu_list(g->local_cpu_list_p, inferred_node_list_p);
         if (NUM_IDS_IN_LIST(inferred_node_list_p) > 0) {
             if (g->topology_source == GPU_TOPOLOGY_NONE) {
                 COPY_LIST(inferred_node_list_p, g->local_node_list_p);
@@ -3580,17 +3581,18 @@ migrate_pages_success:
 }
 
 
-static void build_gpu_preferred_nodes(const process_data_p p, id_list_p out) {
+static id_list_p build_gpu_preferred_nodes(const process_data_p p, id_list_p out) {
     CLEAR_NODE_LIST(out);
 
     if ((p == NULL) || !(p->flags & PROCESS_FLAG_GPU_ACTIVE) || (p->gpu_list_p == NULL)) {
-        return;
+        return out;
     }
     for (int g = 0; g < gpu_count; g++) {
         if (ID_IS_IN_LIST(g, p->gpu_list_p) && gpu_has_resolved_local_nodes(&gpu[g])) {
             OR_LISTS(out, out, gpu[g].local_node_list_p);
         }
     }
+    return out;
 }
 
 static void log_gpu_placement_context(const process_data_p p, id_list_p preferred_nodes_p) {
@@ -4011,7 +4013,7 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
 
     static id_list_p preferred_nodes_p;
     if ((p != NULL) && (p->flags & PROCESS_FLAG_GPU_ACTIVE)) {
-        build_gpu_preferred_nodes(p, preferred_nodes_p);
+        preferred_nodes_p = build_gpu_preferred_nodes(p, preferred_nodes_p);
         if (pid > 0) {
             log_gpu_placement_context(p, preferred_nodes_p);
         }
@@ -4337,7 +4339,7 @@ int manage_loads() {
         }
         CLEAR_NODE_LIST(gpu_preferred_nodes_p);
         if ((p->flags & PROCESS_FLAG_GPU_ACTIVE) && (p->gpu_list_p != NULL)) {
-            build_gpu_preferred_nodes(p, gpu_preferred_nodes_p);
+            gpu_preferred_nodes_p = build_gpu_preferred_nodes(p, gpu_preferred_nodes_p);
         }
         id_list_p node_list_p = pick_numa_nodes(p->pid, cpu_request, mb_request, assume_enough_cpus);
         // check return value same as p->node_list_p
