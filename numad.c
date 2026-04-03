@@ -854,6 +854,7 @@ struct process_data {
     uint64_t CPUs_used_ring_buf[RING_BUF_SIZE];
     char comm[PROC_COMM_SIZE];
     id_list_p node_list_p;
+    id_list_p last_bound_node_list_p;
     uint64_t *process_MBs;
     uint64_t gpu_vram_mb;
     uint32_t gpu_busy_pct;
@@ -1824,6 +1825,14 @@ static void apply_reserved_cpu_mask(id_list_p mask) {
     }
 }
 
+static void remember_last_bound_target(process_data_p p) {
+    if ((p == NULL) || (p->node_list_p == NULL) || (NUM_IDS_IN_LIST(p->node_list_p) == 0)) {
+        return;
+    }
+    CLEAR_NODE_LIST(p->last_bound_node_list_p);
+    COPY_LIST(p->node_list_p, p->last_bound_node_list_p);
+}
+
 static id_list_p build_target_cpu_mask(const process_data_p p, id_list_p out) {
     if ((p == NULL) || (p->node_list_p == NULL)) {
         numad_log(LOG_CRIT, "Cannot build CPU mask for invalid process data\n");
@@ -1899,6 +1908,7 @@ int process_hash_remove(int pid) {
         process_data_p dp = &process_hash_table[ix];
         if (dp->process_MBs) { free(dp->process_MBs); }
         FREE_LIST(dp->node_list_p);
+        FREE_LIST(dp->last_bound_node_list_p);
         FREE_LIST(dp->gpu_list_p);
         memset(dp, 0, sizeof(process_data_t));
         process_hash_table_used -= 1;
@@ -3207,6 +3217,7 @@ migrate_pages_success:
     } else {
         uint64_t t1 = get_time_stamp();
         p->bind_time_stamp = t1;
+        remember_last_bound_target(p);
         if (affinity_errors > 0) {
             numad_log(LOG_WARNING, "PID %d affinity target node(s) %s applied with %d task affinity error(s) in %d.%d seconds\n",
                       p->pid, node_list_str, affinity_errors, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
@@ -3998,7 +4009,18 @@ int manage_loads() {
         // check return value same as p->node_list_p
         int rc = 0;
         if ((node_list_p != NULL) && (NUM_IDS_IN_LIST(node_list_p) > 0)) {
-            if (scx_mode == SCX_MODE_OBSERVE) {
+            if ((p->last_bound_node_list_p != NULL)
+                && (NUM_IDS_IN_LIST(p->last_bound_node_list_p) > 0)
+                && EQUAL_LISTS(node_list_p, p->last_bound_node_list_p)
+                && (p->bind_time_stamp + ((uint64_t)bind_cooldown_sec * ONE_HUNDRED) > time_stamp)) {
+                if (log_level >= LOG_DEBUG) {
+                    char target_buf[BUF_SIZE];
+                    str_from_node_ix_list_as_node_ids(target_buf, BUF_SIZE, node_list_p);
+                    numad_log(LOG_DEBUG,
+                              "Skipping repeated same-target rebind for PID %d %s toward node(s) (%s); last successful target is still within cooldown.\n",
+                              p->pid, process_comm_name(p), target_buf);
+                }
+            } else if (scx_mode == SCX_MODE_OBSERVE) {
                 numad_log(LOG_NOTICE, "SCX observe mode: PID %d would be rebound now\n", p->pid);
             } else {
                 char migrate_reason[BUF_SIZE];
@@ -4009,6 +4031,7 @@ int manage_loads() {
                     char current_buf[BUF_SIZE];
                     str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
                     p->bind_time_stamp = get_time_stamp();
+                    remember_last_bound_target(p);
                     numad_log(LOG_DEBUG,
                               "PID %d %s target node(s) unchanged (%s); keeping current affinity because memory migration is skipped: %s\n",
                               p->pid, process_comm_name(p), current_buf,
