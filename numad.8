@@ -221,9 +221,12 @@ collector; the AMD SMI process collector is not implemented yet.
 .TP
 \fB\-\-gpu-min-busy\fR=\fIPCT\fP
 Minimum GPU engine busy percentage required for automatic GPU-driven management.
+Discovering GPU topology alone does not make a process automatically manageable.
 .TP
 \fB\-\-gpu-min-vram\fR=\fIMB\fP
 Minimum VRAM footprint in MB required for automatic GPU-driven management.
+Together with \fB\-\-gpu-min-busy\fR, this filters out tiny GPU users unless they
+are explicitly included.
 .TP
 \fB\-\-gpu-fdinfo-discovery\fR=\fISECONDS\fP
 Interval in seconds between full DRM fdinfo discovery passes.
@@ -239,8 +242,10 @@ Upper GPU busy threshold for automatic memory migration in \fIauto\fP mode.
 \fB\-\-gpu-graphics-placement\fR=\fIauto|prefer|strict\fP
 Select how strongly numad keeps graphics-oriented GPU workloads on the NUMA node
 nearest the active GPU.  \fIauto\fP preserves the historical behavior of trying
-GPU-local nodes first and then falling back to generic NUMA placement.
-\fIprefer\fP makes that soft preference explicit for graphics workloads.
+GPU-local nodes first and then widening to generic NUMA placement when needed,
+while still keeping at least one GPU-local NUMA node in the final target set.
+\fIprefer\fP makes that soft preference explicit for graphics workloads and keeps
+the same GPU-local safety guarantee during fallback.
 \fIstrict\fP disables fallback outside GPU-local nodes when valid GPU-local
 NUMA topology was discovered for the graphics workload.
 .TP
@@ -266,7 +271,11 @@ AMD GPU telemetry gathered from DRM fdinfo and GPU topology data from sysfs.
 The fdinfo backend is the currently implemented process telemetry path.
 Processes without GPU activity continue to use the legacy CPU and memory based
 placement path.  The \fIamdsmi\fP backend option is reserved for future work and
-currently falls back to the fdinfo collector.
+currently falls back to the fdinfo collector.  Automatic GPU-driven management
+requires the workload to satisfy \fB\-\-gpu-min-busy\fR or
+\fB\-\-gpu-min-vram\fR unless the PID was explicitly included.  When valid
+GPU-local NUMA topology is known, generic fallback preserves at least one
+GPU-local NUMA node in the final target set.
 .SH "SCHED_EXT COMPATIBILITY"
 .LP
 numad never starts or stops a sched_ext scheduler automatically.  numad only

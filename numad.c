@@ -941,6 +941,32 @@ static id_list_p build_node_list_from_cpu_list(id_list_p cpu_list_p, id_list_p o
     return out_node_list_p;
 }
 
+static int node_lists_intersect(id_list_p list_a_p, id_list_p list_b_p) {
+    if ((list_a_p == NULL) || (list_b_p == NULL)) {
+        return 0;
+    }
+    for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
+        if (ID_IS_IN_LIST(node_ix, list_a_p) && ID_IS_IN_LIST(node_ix, list_b_p)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int add_missing_nodes_to_list(id_list_p dst_list_p, id_list_p required_list_p) {
+    if ((dst_list_p == NULL) || (required_list_p == NULL)) {
+        return 0;
+    }
+    int added = 0;
+    for (int node_ix = 0; node_ix < num_nodes; node_ix++) {
+        if (ID_IS_IN_LIST(node_ix, required_list_p) && !ID_IS_IN_LIST(node_ix, dst_list_p)) {
+            ADD_ID_TO_LIST(node_ix, dst_list_p);
+            added = 1;
+        }
+    }
+    return added;
+}
+
 static int gpu_has_resolved_local_nodes(const gpu_device_p g) {
     return ((g != NULL)
             && (g->local_node_list_p != NULL)
@@ -1723,8 +1749,7 @@ static int process_is_manageable_now(const process_data_p p, uint64_t now) {
     if (gpu_sample_is_fresh(p, now)
         && (p->flags & PROCESS_FLAG_GPU_ACTIVE)
         && ((p->gpu_busy_pct >= (uint32_t)gpu_min_busy_pct)
-            || (p->gpu_vram_mb >= (uint64_t)gpu_min_vram_mb)
-            || ((p->gpu_list_p != NULL) && (NUM_IDS_IN_LIST(p->gpu_list_p) > 0)))) {
+            || (p->gpu_vram_mb >= (uint64_t)gpu_min_vram_mb))) {
         return 1;
     }
     return ((p->CPUs_used > CPU_THRESHOLD) && (p->MBs_used > MEMORY_THRESHOLD));
@@ -3615,7 +3640,8 @@ static void log_gpu_placement_context(const process_data_p p, id_list_p preferre
 }
 
 static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_enough_cpus,
-                                      id_list_p candidate_nodes_p) {
+                                      id_list_p candidate_nodes_p,
+                                      id_list_p required_nodes_p) {
     if (log_level >= LOG_DEBUG) {
         numad_log(LOG_DEBUG, "PICK NODES FOR:  PID: %d,  CPUs %d,  MBs %d\n", pid, cpus, mbs);
     }
@@ -3942,6 +3968,23 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
         CLEAR_NODE_LIST(target_node_list_p);
         return target_node_list_p;
     }
+
+    if ((required_nodes_p != NULL)
+        && (NUM_IDS_IN_LIST(required_nodes_p) > 0)
+        && !node_lists_intersect(target_node_list_p, required_nodes_p)) {
+        char target_before[BUF_SIZE];
+        char required_buf[BUF_SIZE];
+        str_from_node_ix_list_as_node_ids(target_before, BUF_SIZE, target_node_list_p);
+        str_from_node_ix_list_as_node_ids(required_buf, BUF_SIZE, required_nodes_p);
+        if (add_missing_nodes_to_list(target_node_list_p, required_nodes_p) && (pid > 0)) {
+            char target_after[BUF_SIZE];
+            str_from_node_ix_list_as_node_ids(target_after, BUF_SIZE, target_node_list_p);
+            numad_log(LOG_NOTICE,
+                      "PID %d %s generic fallback target nodes (%s) excluded GPU-local node(s) (%s); expanding target to nodes (%s)\n",
+                      pid, process_comm_name(p), target_before, required_buf, target_after);
+        }
+    }
+
     // int avg_mbs_per_node = p->MBs_used / NUM_IDS_IN_LIST(target_node_list_p);
 
     // For existing processes, calculate the non-local memory percent to see if
@@ -4017,12 +4060,13 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
         if (pid > 0) {
             log_gpu_placement_context(p, preferred_nodes_p);
         }
-            if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
+        if ((preferred_nodes_p != NULL) && (NUM_IDS_IN_LIST(preferred_nodes_p) > 0)) {
             char preferred_buf[BUF_SIZE];
             str_from_node_ix_list_as_node_ids(preferred_buf, BUF_SIZE, preferred_nodes_p);
             id_list_p preferred = pick_numa_nodes_core(pid, cpus, mbs,
                                                        assume_enough_cpus,
-                                                       preferred_nodes_p);
+                                                       preferred_nodes_p,
+                                                       NULL);
             if (preferred == NULL) {
                 return NULL;
             }
@@ -4049,6 +4093,10 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
                           p->pid, process_comm_name(p), preferred_buf,
                           gpu_graphics_placement_str(gpu_graphics_placement));
             }
+            return pick_numa_nodes_core(pid, cpus, mbs,
+                                        assume_enough_cpus,
+                                        all_nodes_list_p,
+                                        preferred_nodes_p);
         } else if (pid > 0) {
             if ((p->node_list_p != NULL)
                 && (NUM_IDS_IN_LIST(p->node_list_p) > 0)
@@ -4061,7 +4109,8 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
                           p->pid, process_comm_name(p), current_buf);
                 id_list_p sticky = pick_numa_nodes_core(pid, cpus, mbs,
                                                         assume_enough_cpus,
-                                                        p->node_list_p);
+                                                        p->node_list_p,
+                                                        NULL);
                 if (sticky == NULL) {
                     return NULL;
                 }
@@ -4079,7 +4128,8 @@ id_list_p pick_numa_nodes(int pid, int cpus, int mbs, int assume_enough_cpus) {
         }
     }
 
-    return pick_numa_nodes_core(pid, cpus, mbs, assume_enough_cpus, all_nodes_list_p);
+    return pick_numa_nodes_core(pid, cpus, mbs, assume_enough_cpus,
+                                all_nodes_list_p, NULL);
 }
 
 

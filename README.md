@@ -49,6 +49,8 @@ This fork adds GPU-aware placement logic for AMD GPU systems.
 - GPU-aware NUMA node preference
 - switchable graphics placement policy: `auto`, `prefer`, or `strict`
 - DRM `fdinfo`-based process activity tracking
+- threshold-based automatic GPU admission so tiny VRAM users do not crowd out
+  larger GPU workloads just because GPU topology was detected
 - stale GPU state aging and cleanup
 - safer handling of low-RSS but GPU-significant processes
 
@@ -62,12 +64,15 @@ The `amdsmi` backend option is currently treated as a warning/fallback path rath
 
 `amogus-numa-daemon` now exposes `--gpu-graphics-placement=auto|prefer|strict` for graphics-oriented GPU workloads.
 
-- `auto` keeps the historical behavior: try GPU-local NUMA nodes first, then fall back to generic NUMA placement when needed.
-- `prefer` is the explicit soft mode: GUI / graphics processes prefer GPU-local NUMA nodes, but fallback remains allowed.
+- `auto` keeps the historical behavior: try GPU-local NUMA nodes first, then widen to generic NUMA placement when needed, while still preserving at least one GPU-local NUMA node in the final target set.
+- `prefer` is the explicit soft mode: GUI / graphics processes prefer GPU-local NUMA nodes, and fallback may widen to additional nodes but still preserves GPU-local NUMA membership.
 - `strict` is the hard mode: when a graphics process has valid GPU-local NUMA node information, fallback outside those nodes is refused.
 
 This policy only affects node selection. Memory migration remains controlled separately by `--gpu-migrate`.
 With `--gpu-migrate=auto`, pure graphics workloads still avoid aggressive page migration; the daemon now logs CPU affinity changes and memory migration decisions separately so this is visible in the log.
+Automatic GPU-driven management now requires a workload to meet `--gpu-min-busy`
+or `--gpu-min-vram`; merely discovering an active GPU fdinfo entry/topology is
+no longer enough. Explicitly included PIDs still override these thresholds.
 
 ## `sched_ext` compatibility
 
