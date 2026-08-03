@@ -16,7 +16,7 @@ You should find a copy of v2.1 of the GNU Lesser General Public License
 somewhere on your Linux system; if not, write to the Free Software Foundation,
 Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
-*/ 
+*/
 
 
 // Compile with: gcc -std=gnu99 -g -Wall -pthread -o numad numad.c -lrt -lm
@@ -103,13 +103,18 @@ Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
 #define CONVERT_DIGITS_TO_NUM(p, n) \
     n = *p++ - '0'; \
-    while (isdigit(*p)) { \
+    while (isdigit((unsigned char)*p)) { \
         n *= 10; \
         n += (*p++ - '0'); \
     }
 
 char var_run_file[BUFSIZ], var_log_file[BUFSIZ];
 int num_cpus = 0;
+// num_cpus counts *online* CPUs, but CPU IDs can be sparse (offline CPUs,
+// hotplug).  Anything indexed or bitmasked by CPU ID must be sized by
+// cpu_id_limit -- which is (highest possible CPU ID + 1) -- and never by
+// num_cpus.  Conflating the two overflows the heap when CPUs are offline.
+int cpu_id_limit = 0;
 int num_nodes = 0;
 int threads_per_core = 0;
 uint64_t page_size_in_bytes = 0;
@@ -144,7 +149,7 @@ int got_sigquit = 0;
 
 int get_daemon_pid(int inited);
 
-void sig_handler(int signum) { 
+void sig_handler(int signum) {
     switch (signum) {
         case SIGHUP:  got_sighup  = 1; break;
         case SIGTERM: got_sigterm = 1; break;
@@ -167,6 +172,10 @@ static inline void store_int_relaxed(int *ptr, int value) {
 }
 
 #define READ_INT_SETTING(name) load_int_relaxed(&(name))
+
+// Format-check every numad_log() call at compile time.
+void numad_log(int level, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
 
 void numad_log(int level, const char *fmt, ...) {
     if (level > load_int_relaxed(&log_level)) {
@@ -319,11 +328,48 @@ void flush_msg_queue() {
 void init_msg_queue() {
     //key_t msg_key = 0xdeadbeef;
     key_t msg_key = 0xaddaadda;
-    int msg_flg = 0660 | IPC_CREAT;
+    // Create the queue exclusively and privately.  Without IPC_EXCL an
+    // unprivileged user can pre-create this well-known key and the root daemon
+    // would then attach to a queue that user controls -- letting them inject
+    // commands ('p' to pin arbitrary PIDs, 'i' to shut the daemon down, ...).
+    // 0600 keeps it owner-only; clients must run as the same user (root) too.
+    int msg_flg = 0600 | IPC_CREAT | IPC_EXCL;
     msg_qid = msgget(msg_key, msg_flg);
     if (msg_qid < 0) {
-	numad_log(LOG_CRIT, "msgget failed (errno: %d)\n", errno);
-	exit(EXIT_FAILURE);
+        if (errno != EEXIST) {
+            numad_log(LOG_CRIT, "msgget failed (errno: %d)\n", errno);
+            exit(EXIT_FAILURE);
+        }
+        // The queue already exists -- typically a previous numad run, or a
+        // second invocation sending options to a running daemon.  Attach only
+        // after verifying it really belongs to us.
+        msg_qid = msgget(msg_key, 0600);
+        if (msg_qid < 0) {
+            numad_log(LOG_CRIT, "msgget on existing queue failed (errno: %d)\n", errno);
+            exit(EXIT_FAILURE);
+        }
+        struct msqid_ds qbuf;
+        memset(&qbuf, 0, sizeof(qbuf));
+        if (msgctl(msg_qid, IPC_STAT, &qbuf) < 0) {
+            numad_log(LOG_CRIT, "msgctl(IPC_STAT) failed (errno: %d)\n", errno);
+            exit(EXIT_FAILURE);
+        }
+        uid_t me = geteuid();
+        if ((qbuf.msg_perm.uid != me) || (qbuf.msg_perm.cuid != me)) {
+            numad_log(LOG_CRIT,
+                      "Refusing to use numad message queue owned by uid %u/%u (expected %u) -- "
+                      "it may have been created by another user\n",
+                      (unsigned)qbuf.msg_perm.uid, (unsigned)qbuf.msg_perm.cuid, (unsigned)me);
+            exit(EXIT_FAILURE);
+        }
+        if ((qbuf.msg_perm.mode & (S_IRWXG | S_IRWXO)) != 0) {
+            // Tighten permissions left over from an older numad.
+            qbuf.msg_perm.mode &= ~(S_IRWXG | S_IRWXO);
+            if (msgctl(msg_qid, IPC_SET, &qbuf) < 0) {
+                numad_log(LOG_WARNING,
+                          "Could not restrict numad message queue permissions (errno: %d)\n", errno);
+            }
+        }
     }
     flush_msg_queue();
 }
@@ -363,7 +409,7 @@ typedef struct id_list {
     // Use CPU_SET(3) <sched.h> bitmasks,
     // but bundle size and pointer together
     // and genericize for both CPU and Node IDs
-    cpu_set_t *set_p; 
+    cpu_set_t *set_p;
     size_t bytes;
 } id_list_t, *id_list_p;
 
@@ -409,9 +455,11 @@ extern pid_list_p exclude_pid_list;
     if (list_p->set_p == NULL) { numad_log(LOG_CRIT, "CPU_ALLOC failed\n"); exit(EXIT_FAILURE); } \
     list_p->bytes = CPU_ALLOC_SIZE(num_elements);
 
+// CPU lists are indexed by CPU ID, so they must be allocated to hold
+// cpu_id_limit bits (highest possible CPU ID + 1), not num_cpus bits.
 #define CLEAR_CPU_LIST(list_p) \
     if (list_p == NULL) { \
-        INIT_ID_LIST(list_p, num_cpus); \
+        INIT_ID_LIST(list_p, cpu_id_limit); \
     } \
     CPU_ZERO_S(list_p->bytes, list_p->set_p)
 
@@ -450,8 +498,9 @@ int negate_cpu_list(id_list_p list_p) {
         numad_log(LOG_CRIT, "No CPUs to negate in list!\n");
         exit(EXIT_FAILURE);
     }
-    for (int ix = 0;  (ix < num_cpus);  ix++) {
-        if (ID_IS_IN_LIST(ix, list_p)) {
+    // Negate over CPU IDs, not the online count: an offline CPU's ID still
+    // occupies a bit in the (cpu_id_limit-sized) mask.
+    for (int ix = 0;  (ix < cpu_id_limit);  ix++) {        if (ID_IS_IN_LIST(ix, list_p)) {
             CLR_ID_IN_LIST(ix, list_p);
         } else {
             ADD_ID_TO_LIST(ix, list_p);
@@ -470,9 +519,12 @@ int add_ids_to_list_from_str(id_list_p list_p, char *s) {
     }
     int in_range = 0;
     int next_id = 0;
+    // Anything beyond this many bits can never be in the mask anyway; parsing
+    // a crafted "0-999999999" list would otherwise spin here for seconds.
+    int max_id = (int)(ID_LIST_BYTES(list_p) * CHAR_BIT);
     for (;;) {
         // skip over non-digits
-        while (!isdigit(*s)) {
+        while (!isdigit((unsigned char)*s)) {
             if ((*s == '\n') || (*s == '\0')) {
                 goto return_list;
             }
@@ -482,6 +534,11 @@ int add_ids_to_list_from_str(id_list_p list_p, char *s) {
         }
         int id;
         CONVERT_DIGITS_TO_NUM(s, id);
+        if (id >= max_id) {
+            // Clamp to the last valid bit index: the mask holds bits 0..max_id-1,
+            // so clamping to max_id itself would set a bit past the allocation.
+            id = max_id - 1;
+        }
         if (!in_range) {
             next_id = id;
         }
@@ -494,38 +551,74 @@ return_list:
     return NUM_IDS_IN_LIST(list_p);
 }
 
+// Format an ID list as a comma-separated string of IDs and ID ranges, e.g.
+// "0-21,44-65".  Truncates cleanly (on a range boundary) rather than
+// overflowing when the buffer is too small for the whole list.
+//
+// NOTE: snprintf() returns the length it *would* have written, so its return
+// value must never be added to the output pointer without first checking it
+// against the remaining space -- doing so walks the pointer past the end of the
+// buffer, after which the literal '-' and ',' stores below scribble over the
+// caller's stack.
 int str_from_id_list(char *str_p, int str_size, id_list_p list_p) {
-    char *p = str_p;
-    if ((p == NULL) || (str_size < 3)) {
+    if ((str_p == NULL) || (str_size < 3)) {
         numad_log(LOG_CRIT, "Bad string for ID listing\n");
         exit(EXIT_FAILURE);
     }
-    int n;
-    if ((list_p == NULL) || ((n = NUM_IDS_IN_LIST(list_p)) == 0)) {
-        goto terminate_string;
+    char *p = str_p;
+    str_p[0] = '\0';
+    if ((list_p == NULL) || (NUM_IDS_IN_LIST(list_p) == 0)) {
+        return 0;
     }
+
+    // The list is a bitmask of IDs, so its capacity in bits bounds the scan.
+    int max_id = (int)(ID_LIST_BYTES(list_p) * CHAR_BIT);
+    int wrote_any = 0;
     int id_range_start = -1;
-    for (int id = 0;  ;  id++) {
-        int id_in_list = (ID_IS_IN_LIST(id, list_p) != 0);
-        if ((id_in_list) && (id_range_start < 0)) {
-            id_range_start = id; // beginning an ID range
-        } else if ((!id_in_list) && (id_range_start >= 0)) {
-            // convert the range that just ended...
-            p += snprintf(p, (str_p + str_size - p - 1), "%d", id_range_start);
-            if (id - id_range_start > 1) {
-                *p++ = '-';
-                p += snprintf(p, (str_p + str_size - p - 1), "%d", (id - 1));
-            } 
-            *p++ = ',';
-            id_range_start = -1; // no longer in a range
-            if (n <= 0) { break; } // exit only after finishing a range
+    int truncated = 0;
+
+    for (int id = 0;  (id <= max_id);  id++) {
+        int id_in_list = ((id < max_id) && (ID_IS_IN_LIST(id, list_p) != 0));
+        if (id_in_list) {
+            if (id_range_start < 0) {
+                id_range_start = id;  // beginning an ID range
+            }
+            continue;
         }
-        n -= id_in_list;
+        if (id_range_start < 0) {
+            continue;  // not in a range, nothing to emit
+        }
+        // The range [id_range_start, id-1] just ended -- emit it.
+        char item[64];
+        int item_len;
+        if ((id - 1) > id_range_start) {
+            item_len = snprintf(item, sizeof(item), "%s%d-%d",
+                                wrote_any ? "," : "", id_range_start, (id - 1));
+        } else {
+            item_len = snprintf(item, sizeof(item), "%s%d",
+                                wrote_any ? "," : "", id_range_start);
+        }
+        if ((item_len < 0) || (item_len >= (int)sizeof(item))) {
+            truncated = 1;
+            break;
+        }
+        // Bail out before writing when the remaining space (reserving one byte
+        // for the NUL terminator) cannot hold this item.
+        if (item_len > (str_size - 1 - (int)(p - str_p))) {
+            truncated = 1;
+            break;
+        }
+        memcpy(p, item, (size_t)item_len);
+        p += item_len;
+        *p = '\0';
+        wrote_any = 1;
+        id_range_start = -1;
     }
-    p -= 1; // eliminate trailing ','
-terminate_string:
-    *p = '\0';
-    return (p - str_p);
+    if (truncated) {
+        numad_log(LOG_WARNING,
+                  "ID list truncated to fit a %d byte buffer\n", str_size);
+    }
+    return (int)(p - str_p);
 }
 
 
@@ -679,15 +772,18 @@ static void rebuild_node_id_index(void) {
         }
     }
 
-    if (num_cpus > 0) {
+    // cpu_to_node_ix is indexed by *CPU ID* and must therefore be sized by
+    // cpu_id_limit (which may exceed num_cpus when CPUs are offline), not by
+    // num_cpus.
+    if (cpu_id_limit > 0) {
         cpu_to_node_ix = checked_realloc(cpu_to_node_ix,
-                                         num_cpus * sizeof(*cpu_to_node_ix),
+                                         cpu_id_limit * sizeof(*cpu_to_node_ix),
                                          "cpu_to_node_ix");
     } else {
         free(cpu_to_node_ix);
         cpu_to_node_ix = NULL;
     }
-    for (int cpu = 0; (cpu < num_cpus); cpu++) {
+    for (int cpu = 0; (cpu < cpu_id_limit); cpu++) {
         cpu_to_node_ix[cpu] = -1;
         for (int node_ix = 0; (node_ix < num_nodes); node_ix++) {
             if (ID_IS_IN_LIST(cpu, node[node_ix].cpu_list_p)) {
@@ -789,15 +885,18 @@ static int collect_active_threads_for_pid(int pid, uint64_t num_threads, uint64_
     struct dirent **namelist = NULL;
     int tasks = scandir(task_dir, &namelist, all_digits, NULL);
     if (tasks < 1) {
+        // scandir() allocates the array even when it selects nothing, so a
+        // zero return still has to be freed.
+        free(namelist);
         *active_threads_out = 1;
         return -1;
     }
 
     uint64_t active = 0;
     char stat_buf[BUF_SIZE];
-    char fname[FNAME_SIZE];
+    char fname[PATH_MAX];
     for (int ix = 0; (ix < tasks); ix++) {
-        snprintf(fname, FNAME_SIZE, "%s/%s/stat", task_dir, namelist[ix]->d_name);
+        snprintf(fname, sizeof(fname), "%s/%s/stat", task_dir, namelist[ix]->d_name);
         free(namelist[ix]);
         ssize_t bytes = read_text_file(fname, stat_buf, sizeof(stat_buf));
         if (bytes < 0) {
@@ -823,12 +922,14 @@ node_data_p node = NULL;
 
 int min_node_CPUs_free_id = -1;
 int min_node_MBs_free_id = -1;
-long min_node_CPUs_free = INT_MAX;
-long min_node_MBs_free = INT_MAX;
-long max_node_CPUs_free = 0;
-long max_node_MBs_free = 0;
-long avg_node_CPUs_free = 0;
-long avg_node_MBs_free = 0;
+// These mirror node[].CPUs_free / MBs_free, which are uint64_t; keeping them
+// signed made every comparison below a signed/unsigned mismatch.
+uint64_t min_node_CPUs_free = UINT64_MAX;
+uint64_t min_node_MBs_free = UINT64_MAX;
+uint64_t max_node_CPUs_free = 0;
+uint64_t max_node_MBs_free = 0;
+uint64_t avg_node_CPUs_free = 0;
+uint64_t avg_node_MBs_free = 0;
 double stddev_node_CPUs_free = 0.0;
 double stddev_node_MBs_free = 0.0;
 
@@ -960,11 +1061,11 @@ static int drm_card_and_digits(const struct dirent *dptr) {
         return 0;
     }
     p += 4;
-    if (!isdigit(*p)) {
+    if (!isdigit((unsigned char)*p)) {
         return 0;
     }
     while (*p != '\0') {
-        if (!isdigit(*p++)) {
+        if (!isdigit((unsigned char)*p++)) {
             return 0;
         }
     }
@@ -1177,8 +1278,12 @@ static int read_link_basename(const char *path, char *buf, size_t buf_size) {
     link_buf[n] = '\0';
     char *base = strrchr(link_buf, '/');
     base = (base != NULL) ? (base + 1) : link_buf;
-    strncpy(buf, base, buf_size - 1);
-    buf[buf_size - 1] = '\0';
+    // snprintf() truncates instead of the unchecked-copy pattern below, and
+    // always NUL-terminates.
+    int wrote = snprintf(buf, buf_size, "%s", base);
+    if (wrote < 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -1335,7 +1440,7 @@ static int discover_amdgpu_devices_from_sysfs(void) {
 
     gpu = checked_calloc(cards, sizeof(*gpu), "gpu topology");
 
-    char path[FNAME_SIZE];
+    char path[PATH_MAX];
     char buf[BUF_SIZE];
     for (int ix = 0; ix < cards; ix++) {
         char *card = namelist[ix]->d_name;
@@ -1348,7 +1453,14 @@ static int discover_amdgpu_devices_from_sysfs(void) {
         gpu_device_p g = &gpu[gpu_count];
         memset(g, 0, sizeof(*g));
         g->dev_ix = gpu_count;
-        strncpy(g->drm_name, card, sizeof(g->drm_name) - 1);
+        // DRM names are short ("card0"); anything longer is not a device we
+        // can address, so skip it rather than silently truncating.
+        if (strlen(card) >= sizeof(g->drm_name)) {
+            numad_log(LOG_WARNING, "Ignoring DRM device with overlong name\n");
+            free(namelist[ix]);
+            continue;
+        }
+        memcpy(g->drm_name, card, strlen(card) + 1);
         snprintf(path, sizeof(path), "/sys/class/drm/%s/device", card);
         if (read_link_basename(path, buf, sizeof(buf)) == 0) {
             normalize_pci_bdf(buf, g->pci_bdf, sizeof(g->pci_bdf));
@@ -1410,11 +1522,12 @@ static void update_gpu_topology_if_needed(uint64_t now) {
 }
 
 static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_t now) {
-    char path[FNAME_SIZE];
+    char path[PATH_MAX];
     snprintf(path, sizeof(path), "/proc/%d/fdinfo", pid);
     struct dirent **namelist = NULL;
     int files = scandir(path, &namelist, all_digits, NULL);
     if (files < 1) {
+        free(namelist);  // allocated even when nothing was selected
         return -1;
     }
 
@@ -1443,6 +1556,8 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
         char pdev[GPU_BDF_SIZE] = {0};
         uint64_t engine_ns = 0;
         uint64_t vram_mb = 0;
+        uint64_t resident_vram_mb = 0;
+        uint64_t total_vram_key_mb = 0;
         uint64_t client_id = 0;
         int client_id_valid = 0;
 
@@ -1465,19 +1580,47 @@ static int collect_amdgpu_fdinfo_for_pid(int pid, process_data_p sample, uint64_
                     client_id_valid = 1;
                 }
             } else if (strncmp(line, "drm-memory-vram:", 16) == 0) {
+                // Legacy single key, still emitted by some kernels.
                 vram_mb += fdinfo_mem_to_mb(line);
+            } else if (strncmp(line, "drm-resident-vram:", 18) == 0) {
+                // Modern kernels split VRAM accounting; the resident set is
+                // what the process actually keeps mapped.
+                resident_vram_mb += fdinfo_mem_to_mb(line);
+            } else if (strncmp(line, "drm-total-vram:", 15) == 0) {
+                total_vram_key_mb += fdinfo_mem_to_mb(line);
             } else if (strncmp(line, "drm-engine-", 11) == 0) {
                 engine_ns += fdinfo_engine_ns(line);
-                if (strstr(line, "compute") != NULL) {
-                    fd_saw_compute = 1;
+                // Classify the engine family, not just the word "compute".
+                // Copy engines (drm-engine-sdma, ...) belong to DMA traffic,
+                // not to rendering, so they must not flip a compute-only
+                // workload into the "graphics" bucket.
+                const char *engine = line + 11;
+                int is_compute = 0;
+                int is_graphics = 0;
+                if ((strncmp(engine, "compute", 7) == 0)
+                    || (strncmp(engine, "gfx", 3) == 0)) {
+                    is_compute = 1;
+                } else if ((strncmp(engine, "sdma", 4) == 0)
+                           || (strncmp(engine, "dma", 3) == 0)) {
+                    is_compute = 0;  // DMA: neither compute nor graphics
+                } else if (strstr(engine, "copy") != NULL) {
+                    is_compute = 0;
                 } else {
-                    fd_saw_graphics = 1;
+                    is_graphics = 1;  // anything else (vcn, uvd, vce, jpeg...)
                 }
+                fd_saw_compute |= is_compute;
+                fd_saw_graphics |= is_graphics;
             }
         }
 
         if (!is_amdgpu) {
             continue;
+        }
+        // Pick one VRAM figure per fd.  The legacy drm-memory-vram key wins if
+        // present; otherwise prefer the resident set over the total, since
+        // total counts evicted/shared pages the process is not really holding.
+        if (vram_mb == 0) {
+            vram_mb = (resident_vram_mb > 0) ? resident_vram_mb : total_vram_key_mb;
         }
         found = 1;
         if ((pdev[0] != '\0') && (gpu_count > 0)) {
@@ -1594,6 +1737,7 @@ static void update_gpu_processes_fdinfo(uint64_t now) {
     }
     gpu_fdinfo_last_full_scan = now;
 
+    int scan_all = READ_INT_SETTING(scan_all_processes);
     struct dirent **namelist = NULL;
     int files = scandir("/proc", &namelist, name_starts_with_digit, NULL);
     if (files < 0) {
@@ -1609,6 +1753,12 @@ static void update_gpu_processes_fdinfo(uint64_t now) {
         int explicit_pid = pid_is_in_list(include_pid_list, pid);
         pthread_mutex_unlock(&pid_list_mutex);
         if (excluded) {
+            continue;
+        }
+        // Honor "-S 0" here too.  Otherwise GPU discovery would keep promoting
+        // arbitrary processes into the hash table even though the operator
+        // asked us to manage only the explicit inclusion list.
+        if (!scan_all && !explicit_pid) {
             continue;
         }
 
@@ -1940,9 +2090,16 @@ int process_hash_update(process_data_p newp) {
             new_hash_table_entry = 0;
             p->ring_buf_ix += 1;
             p->ring_buf_ix &= (RING_BUF_SIZE - 1);
-            uint64_t cpu_util_diff = newp->cpu_util  - p->cpu_util;
-            uint64_t  time_diff = newp->data_time_stamp - p->data_time_stamp;
-            p->CPUs_used_ring_buf[p->ring_buf_ix] = 100 * (cpu_util_diff) / time_diff;
+            uint64_t time_diff = newp->data_time_stamp - p->data_time_stamp;
+            uint64_t cpu_util_diff = (newp->cpu_util > p->cpu_util)
+                                   ? (newp->cpu_util - p->cpu_util) : 0;
+            if (time_diff == 0) {
+                time_diff = 1;  // never divide by zero
+            }
+            // 100 * diff can overflow the ring-buffer slot for a long-lived,
+            // heavily busy process; clamp instead of wrapping.
+            uint64_t util = (cpu_util_diff * 100) / time_diff;
+            p->CPUs_used_ring_buf[p->ring_buf_ix] = MIN(util, (uint64_t)INT_MAX);
             // Use largest CPU utilization currently in ring buffer
             uint64_t max_CPUs_used = p->CPUs_used_ring_buf[0];
             for (int ix = 1;  (ix < RING_BUF_SIZE);  ix++) {
@@ -2018,12 +2175,6 @@ int process_hash_update(process_data_p newp) {
 static void apply_reserved_cpu_mask(id_list_p mask) {
     if ((mask != NULL) && (reserved_cpu_mask_list_p != NULL)) {
         AND_LISTS(mask, mask, reserved_cpu_mask_list_p);
-    }
-}
-
-static void remember_last_bound_target(process_data_p p) {
-    if ((p == NULL) || (p->node_list_p == NULL) || (NUM_IDS_IN_LIST(p->node_list_p) == 0)) {
-        return;
     }
 }
 
@@ -2190,17 +2341,31 @@ static id_list_p build_target_cpu_mask(const process_data_p p, id_list_p out) {
     if ((p->flags & PROCESS_FLAG_GPU_ACTIVE) && (p->gpu_list_p != NULL) && (gpu_count > 0)) {
         static id_list_p gpu_local_cpu_union_p = NULL;
         static id_list_p narrowed_p = NULL;
+        static id_list_p gpu_local_node_union_p = NULL;
 
         CLEAR_CPU_LIST(gpu_local_cpu_union_p);
+        CLEAR_NODE_LIST(gpu_local_node_union_p);
         for (int g = 0; g < gpu_count; g++) {
-            if (ID_IS_IN_LIST(g, p->gpu_list_p) && (gpu[g].local_cpu_list_p != NULL)) {
-                OR_LISTS(gpu_local_cpu_union_p, gpu_local_cpu_union_p, gpu[g].local_cpu_list_p);
+            if (ID_IS_IN_LIST(g, p->gpu_list_p)) {
+                if (gpu[g].local_cpu_list_p != NULL) {
+                    OR_LISTS(gpu_local_cpu_union_p, gpu_local_cpu_union_p, gpu[g].local_cpu_list_p);
+                }
+                if (gpu[g].local_node_list_p != NULL) {
+                    OR_LISTS(gpu_local_node_union_p, gpu_local_node_union_p, gpu[g].local_node_list_p);
+                }
             }
         }
         if (NUM_IDS_IN_LIST(gpu_local_cpu_union_p) > 0) {
             CLEAR_CPU_LIST(narrowed_p);
             AND_LISTS(narrowed_p, out, gpu_local_cpu_union_p);
-            if (NUM_IDS_IN_LIST(narrowed_p) > 0) {
+            // Narrow the CPU affinity to the GPU-local CPUs only while the
+            // process's memory is contained within the GPU-local nodes.  A
+            // big-memory process (e.g. AI inference holding experts in RAM
+            // across several nodes) must be allowed to spread its threads
+            // across all of its target nodes; stacking them on the GPU node's
+            // CPUs would oversubscribe them and force remote memory access.
+            if ((NUM_IDS_IN_LIST(narrowed_p) > 0)
+                && node_list_is_subset_of(p->node_list_p, gpu_local_node_union_p)) {
                 COPY_LIST(narrowed_p, out);
             }
         }
@@ -2478,7 +2643,8 @@ void set_thp_scan_sleep_ms(int new_ms) {
     int fd = open(thp_scan_fname, O_RDWR, 0);
     if (fd >= 0) {
         char buf[BUF_SIZE];
-        int bytes = read(fd, buf, BUF_SIZE);
+        // Leave room for the NUL: buf[BUF_SIZE] would be one past the end.
+        int bytes = read(fd, buf, BUF_SIZE - 1);
         if (bytes > 0) {
             buf[bytes] = '\0';
             int cur_ms;
@@ -2495,7 +2661,7 @@ void set_thp_scan_sleep_ms(int new_ms) {
     }
 }
 
-void check_prereqs(char *prog_name) {
+void check_prereqs(void) {
     // Adjust kernel tunable to scan for THP more frequently...
     set_thp_scan_sleep_ms(thp_scan_sleep_ms);
 }
@@ -2507,9 +2673,13 @@ int get_daemon_pid(int inited) {
         return 0;
     }
     char buf[BUF_SIZE];
-    int bytes = read(fd, buf, BUF_SIZE);
+    int bytes = read(fd, buf, BUF_SIZE - 1);
     close(fd);
     if (bytes <= 0) {
+        return 0;
+    }
+    buf[bytes] = '\0';  // CONVERT_DIGITS_TO_NUM scans until a non-digit
+    if (!isdigit((unsigned char)buf[0])) {
         return 0;
     }
     int pid;
@@ -2526,7 +2696,7 @@ int get_daemon_pid(int inited) {
         return 0;
     }
     // Daemon must be running already.
-    return pid; 
+    return pid;
 }
 
 int register_numad_pid() {
@@ -2548,9 +2718,13 @@ create_run_file:
         if (fd < 0) {
             goto fail_numad_run_file;
         }
-        int bytes = read(fd, buf, BUF_SIZE);
+        int bytes = read(fd, buf, BUF_SIZE - 1);
         close(fd);
         if (bytes > 0) {
+            buf[bytes] = '\0';  // terminate before scanning for digits
+            if (!isdigit((unsigned char)buf[0])) {
+                goto fail_numad_run_file;
+            }
             char *p = buf;
             CONVERT_DIGITS_TO_NUM(p, pid);
             // Check pid in run file still active
@@ -2565,7 +2739,7 @@ create_run_file:
                 }
             }
             // Daemon must be running already.
-            return pid; 
+            return pid;
         }
     }
 fail_numad_run_file:
@@ -2579,10 +2753,14 @@ int count_set_bits_in_hex_list_file(char *fname) {
     int fd = open(fname, O_RDONLY, 0);
     if (fd >= 0) {
         char buf[BUF_SIZE];
-        int bytes = read(fd, buf, BUF_SIZE);
+        int bytes = read(fd, buf, BUF_SIZE - 1);
         close(fd);
+        if (bytes < 0) {
+            return 0;
+        }
+        buf[bytes] = '\0';
         for (int ix = 0;  (ix < bytes);  ix++) {
-            char c = tolower(buf[ix]);
+            char c = tolower((unsigned char)buf[ix]);
             switch (c) {
                 case '0'  : sum += 0; break;
                 case '1'  : sum += 1; break;
@@ -2625,6 +2803,43 @@ int get_num_cpus() {
 }
 
 
+// Return (highest possible CPU ID + 1).  CPU IDs are sparse whenever CPUs are
+// offline or hot-unplugged, so this is >= num_cpus and is the correct size for
+// anything indexed or bitmasked by CPU ID.
+int get_cpu_id_limit() {
+    int limit = 0;
+    char buf[BUF_SIZE];
+    // /sys/.../cpu/present lists every CPU the kernel knows about, online or
+    // not, e.g. "0-7" or "0-3,8-11".  Take the last ID mentioned.
+    if (read_first_line("/sys/devices/system/cpu/present", buf, sizeof(buf)) == 0) {
+        char *last = strrchr(buf, '-');
+        char *comma = strrchr(buf, ',');
+        if ((comma != NULL) && ((last == NULL) || (comma > last))) {
+            last = comma;
+        }
+        const char *p = (last != NULL) ? (last + 1) : buf;
+        errno = 0;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if ((errno == 0) && (end != p) && (v >= 0) && (v < INT_MAX - 1)) {
+            limit = (int)v + 1;
+        }
+    }
+    int configured = sysconf(_SC_NPROCESSORS_CONF);
+    if (configured > limit) {
+        limit = configured;
+    }
+    if (limit < num_cpus) {
+        limit = num_cpus;
+    }
+    if (limit < 1) {
+        numad_log(LOG_CRIT, "Cannot determine CPU ID limit\n");
+        exit(EXIT_FAILURE);
+    }
+    return limit;
+}
+
+
 int get_num_kvm_vcpu_threads(int pid) {
     // Try to return the number of vCPU threads for this VM guest,
     // excluding the IO threads.  All failures return INT_MAX.
@@ -2634,15 +2849,16 @@ int get_num_kvm_vcpu_threads(int pid) {
     int fd = open(fname, O_RDONLY, 0);
     if (fd >= 0) {
         char buf[BUF_SIZE];
-        int bytes = read(fd, buf, BUF_SIZE);
+        int bytes = read(fd, buf, BUF_SIZE - 1);
         close(fd);
         if (bytes > 0) {
+            buf[bytes] = '\0';
             char *p = memmem(buf, bytes, "smp", 3);
             if (p != NULL) {
-                while (!isdigit(*p) && (p - buf < bytes - 2)) {
+                while ((p - buf < bytes - 2) && !isdigit((unsigned char)*p)) {
                     p++;
                 }
-                if (isdigit(*p)) {
+                if (isdigit((unsigned char)*p)) {
                     int vcpu_threads;
                     CONVERT_DIGITS_TO_NUM(p, vcpu_threads);
                     if ((vcpu_threads > 0) && (vcpu_threads <= num_cpus)) {
@@ -2667,7 +2883,7 @@ uint64_t get_huge_page_size_in_bytes() {
     while (fgets(buf, BUF_SIZE, fs)) {
         if (!strncmp("Hugepagesize", buf, 12)) {
             char *p = &buf[12];
-            while ((!isdigit(*p)) && (p < buf + BUF_SIZE)) {
+            while ((!isdigit((unsigned char)*p)) && (p < buf + BUF_SIZE)) {
                 p++;
             }
             huge_page_size = atol(p);
@@ -2681,7 +2897,7 @@ uint64_t get_huge_page_size_in_bytes() {
 
 uint64_t get_time_stamp() {
     // Return time stamp in hundredths of a second
-    struct timespec ts; 
+    struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0) {
         numad_log(LOG_CRIT, "Cannot get clock_gettime()\n");
         exit(EXIT_FAILURE);
@@ -2692,7 +2908,7 @@ uint64_t get_time_stamp() {
 
 
 static int name_starts_with_digit(const struct dirent *dptr) {
-    return (isdigit(dptr->d_name[0]));
+    return (isdigit((unsigned char)dptr->d_name[0]));
 }
 
 
@@ -2748,8 +2964,10 @@ void update_cpu_data() {
             numad_log(LOG_CRIT, "Cannot get /proc/stat contents\n");
             exit(EXIT_FAILURE);
         }
-        cpu_data_buf[0].idle = checked_malloc(num_cpus * sizeof(uint64_t), "cpu_data_buf[0].idle");
-        cpu_data_buf[1].idle = checked_malloc(num_cpus * sizeof(uint64_t), "cpu_data_buf[1].idle");
+        // Indexed by CPU ID (which is sparse when CPUs are offline), so size
+        // by cpu_id_limit.  Using num_cpus here overflowed the heap.
+        cpu_data_buf[0].idle = checked_calloc(cpu_id_limit, sizeof(uint64_t), "cpu_data_buf[0].idle");
+        cpu_data_buf[1].idle = checked_calloc(cpu_id_limit, sizeof(uint64_t), "cpu_data_buf[1].idle");
     }
     // Use the other cpu_data buffer...
     int new = 1 - cur_cpu_data_buf;
@@ -2758,7 +2976,7 @@ void update_cpu_data() {
     // Now pull the idle stat from each cpu<N> line
     char buf[BUF_SIZE];
     while (fgets(buf, BUF_SIZE, fs)) {
-        /* 
+        /*
         * Lines are of the form:
         *
         * cpu<N> user nice system idle iowait irq softirq steal guest guest_nice
@@ -2768,15 +2986,28 @@ void update_cpu_data() {
         * cpu0 190540 0 1071 52232942 39 7538 234039 0 0 0
         * cpu1 124519 0 50 52545188 0 1443 6267 0 0 0
         * cpu2 143133 0 452 52531440 36 1573 834 0 0 0
-        * . . . . 
+        * . . . .
         */
-        if ( (buf[0] == 'c') && (buf[1] == 'p') && (buf[2] == 'u') && (isdigit(buf[3])) ) {
+        if ( (buf[0] == 'c') && (buf[1] == 'p') && (buf[2] == 'u') && (isdigit((unsigned char)buf[3])) ) {
             char *p = &buf[3];
-            int cpu_id = *p++ - '0'; while (isdigit(*p)) { cpu_id *= 10; cpu_id += (*p++ - '0'); }
-            while (!isdigit(*p)) { p++; } while (isdigit(*p)) { p++; }  // skip user
-            while (!isdigit(*p)) { p++; } while (isdigit(*p)) { p++; }  // skip nice
-            while (!isdigit(*p)) { p++; } while (isdigit(*p)) { p++; }  // skip system
-            while (!isdigit(*p)) { p++; }
+            int cpu_id = *p++ - '0'; while (isdigit((unsigned char)*p)) { cpu_id *= 10; cpu_id += (*p++ - '0'); }
+            // Bound-check the parsed CPU ID before using it as an index.  A CPU
+            // hot-added after startup can report an ID beyond our allocation.
+            if ((cpu_id < 0) || (cpu_id >= cpu_id_limit)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring /proc/stat cpu%d line: CPU ID is outside the known range (limit %d)\n",
+                          cpu_id, cpu_id_limit);
+                continue;
+            }
+            // skip user, nice, system
+            for (int field = 0; (field < 3); field++) {
+                while (!isdigit((unsigned char)*p) && (*p != '\0') && (*p != '\n')) { p++; }
+                while (isdigit((unsigned char)*p)) { p++; }
+            }
+            while (!isdigit((unsigned char)*p) && (*p != '\0') && (*p != '\n')) { p++; }
+            if (!isdigit((unsigned char)*p)) {
+                continue;  // malformed line -- no idle field
+            }
             uint64_t idle;
             CONVERT_DIGITS_TO_NUM(p, idle);
             cpu_data_buf[new].idle[cpu_id] = idle;
@@ -2793,7 +3024,7 @@ int node_and_digits(const struct dirent *dptr) {
     if (*p++ != 'd') return 0;
     if (*p++ != 'e') return 0;
     do {
-        if (!isdigit(*p++))
+        if (!isdigit((unsigned char)*p++))
             return 0;
     } while (*p != '\0');
     return 1;
@@ -2808,14 +3039,22 @@ char *reserved_cpu_str = NULL;
 
 
 void show_nodes(int nodes) {
-    assert(nodes == num_nodes);
+    // Never abort() a running daemon over a logging inconsistency: the node
+    // count can legitimately change between update_nodes() and this call.
+    if (nodes != num_nodes) {
+        numad_log(LOG_DEBUG,
+                  "Node count changed from %d to %d while logging node info\n",
+                  nodes, num_nodes);
+    }
     pthread_mutex_lock(&log_mutex);
     FILE *dest = (log_fs != NULL) ? log_fs : stderr;
     fprintf(dest, "\n");
     fprintf(dest, "Nodes: %d\n", num_nodes);
     for (int ix = 0;  (ix < num_nodes);  ix++) {
-        fprintf(dest, "Node[%d] ID %ld, MBs_tot %ld, MBs_free %ld, CPUs_tot %ld, CPUs_free %ld, Dist ", 
-            ix, node[ix].node_id, node[ix].MBs_total, node[ix].MBs_free, node[ix].CPUs_total, node[ix].CPUs_free);
+        fprintf(dest, "Node[%d] ID %llu, MBs_tot %llu, MBs_free %llu, CPUs_tot %llu, CPUs_free %llu, Dist ",
+            ix, (unsigned long long)node[ix].node_id, (unsigned long long)node[ix].MBs_total,
+            (unsigned long long)node[ix].MBs_free, (unsigned long long)node[ix].CPUs_total,
+            (unsigned long long)node[ix].CPUs_free);
         for (int d = 0;  (d < num_nodes);  d++) {
             fprintf(dest, "%d ", node[ix].distance[d]);
         }
@@ -2823,10 +3062,12 @@ void show_nodes(int nodes) {
         str_from_id_list(buf, BUF_SIZE, node[ix].cpu_list_p);
         fprintf(dest, " CPUs %s\n", buf);
     }
-    fprintf(dest, "Min CPUs free: %ld, Max CPUs: %ld, Avg CPUs: %ld, StdDev: %.2lf\n", 
-        min_node_CPUs_free, max_node_CPUs_free, avg_node_CPUs_free, stddev_node_CPUs_free);
-    fprintf(dest, "Min MBs free: %ld, Max MBs: %ld, Avg MBs: %ld, StdDev: %.2lf\n", 
-        min_node_MBs_free, max_node_MBs_free, avg_node_MBs_free, stddev_node_MBs_free);
+    fprintf(dest, "Min CPUs free: %llu, Max CPUs: %llu, Avg CPUs: %llu, StdDev: %.2lf\n",
+        (unsigned long long)min_node_CPUs_free, (unsigned long long)max_node_CPUs_free,
+        (unsigned long long)avg_node_CPUs_free, stddev_node_CPUs_free);
+    fprintf(dest, "Min MBs free: %llu, Max MBs: %llu, Avg MBs: %llu, StdDev: %.2lf\n",
+        (unsigned long long)min_node_MBs_free, (unsigned long long)max_node_MBs_free,
+        (unsigned long long)avg_node_MBs_free, stddev_node_MBs_free);
     fflush(dest);
     pthread_mutex_unlock(&log_mutex);
 }
@@ -2931,7 +3172,10 @@ int update_nodes() {
             }
             node = checked_realloc(node, num_files * sizeof(node_data_t), "node");
             for (int ix = num_nodes;  (ix < num_files);  ix++) {
-                // If new > old, nullify new node_data pointers
+                // If new > old, zero the new node_data.  realloc() leaves the
+                // tail uninitialized, and the MBs_total/CPUs_total sums below
+                // would otherwise read indeterminate values on the first pass.
+                memset(&node[ix], 0, sizeof(node_data_t));
                 node[ix].distance = NULL;
                 node[ix].cpu_list_p = NULL;
             }
@@ -2994,15 +3238,39 @@ int update_nodes() {
             }
             snprintf(fname, FNAME_SIZE, "/sys/devices/system/node/node%d/distance", node_id);
             fd = open(fname, O_RDONLY, 0);
-            if ((fd >= 0) && (read(fd, buf, BIG_BUF_SIZE) > 0)) {
+            ssize_t dist_bytes = -1;
+            if (fd >= 0) {
+                dist_bytes = read(fd, buf, BIG_BUF_SIZE - 1);
+                close(fd);
+            }
+            if (dist_bytes > 0) {
+                buf[dist_bytes] = '\0';
                 int rnode = 0;
-                for (char *p = buf;  (*p != '\n'); ) {
+                // Bound by num_nodes: a short or malformed SLIT table would
+                // otherwise run past the end of the distance array.
+                for (char *p = buf;  (rnode < num_nodes) && (*p != '\0') && (*p != '\n'); ) {
+                    if (!isdigit((unsigned char)*p)) {
+                        p++;
+                        continue;
+                    }
                     int lat;
                     CONVERT_DIGITS_TO_NUM(p, lat);
-                    node[node_ix].distance[rnode++] = lat;
+                    // Distances divide magnitudes later on, so a zero here
+                    // would raise SIGFPE.  ACPI defines 10 as "local".
+                    if (lat < 1) {
+                        lat = 10;
+                    }
+                    if (lat > UINT8_MAX) {
+                        lat = UINT8_MAX;
+                    }
+                    node[node_ix].distance[rnode++] = (uint8_t)lat;
                     while (*p == ' ') { p++; }
                 }
-                close(fd);
+                // Any entry the file did not supply still needs a sane value.
+                while (rnode < num_nodes) {
+                    node[node_ix].distance[rnode] = (rnode == node_ix) ? 10 : 20;
+                    rnode++;
+                }
             } else {
                 numad_log(LOG_CRIT, "Could not get node distance data\n");
                 exit(EXIT_FAILURE);
@@ -3015,15 +3283,15 @@ int update_nodes() {
     while (cpu_data_buf[cur_cpu_data_buf].time_stamp + 7 >= time_stamp) {
         // Make sure at least 7/100 of a second has passed.
         // Otherwise sleep for 1/10 second.
-        struct timespec ts = { 0, 100000000 }; 
+        struct timespec ts = { 0, 100000000 };
         nanosleep(&ts, &ts);
         time_stamp = get_time_stamp();
     }
     update_cpu_data();
     max_node_MBs_free = 0;
     max_node_CPUs_free = 0;
-    min_node_MBs_free = INT_MAX;
-    min_node_CPUs_free = INT_MAX;
+    min_node_MBs_free = UINT64_MAX;
+    min_node_CPUs_free = UINT64_MAX;
     uint64_t sum_of_node_MBs_free = 0;
     uint64_t sum_of_node_CPUs_free = 0;
     for (int node_ix = 0;  (node_ix < num_nodes);  node_ix++) {
@@ -3042,7 +3310,7 @@ int update_nodes() {
                 numad_log(LOG_CRIT, "Could not get node MemTotal\n");
                 exit(EXIT_FAILURE);
             }
-            while (!isdigit(*p)) { p++; }
+            while (!isdigit((unsigned char)*p)) { p++; }
             CONVERT_DIGITS_TO_NUM(p, KB);
             node[node_ix].MBs_total = (KB / KILOBYTE);
 /*
@@ -3058,7 +3326,7 @@ int update_nodes() {
                 numad_log(LOG_CRIT, "Could not get node MemFree\n");
                 exit(EXIT_FAILURE);
             }
-            while (!isdigit(*p)) { p++; }
+            while (!isdigit((unsigned char)*p)) { p++; }
             CONVERT_DIGITS_TO_NUM(p, KB);
             node[node_ix].MBs_free = (KB / KILOBYTE);
             if (current_use_inactive_file_cache) {
@@ -3070,7 +3338,7 @@ int update_nodes() {
                     numad_log(LOG_CRIT, "Could not get node Inactive(file)\n");
                     exit(EXIT_FAILURE);
                 }
-                while (!isdigit(*p)) { p++; }
+                while (!isdigit((unsigned char)*p)) { p++; }
                 CONVERT_DIGITS_TO_NUM(p, KB);
                 node[node_ix].MBs_free += (KB / KILOBYTE);
             }
@@ -3091,24 +3359,29 @@ int update_nodes() {
         int old_cpu_data_buf = 1 - cur_cpu_data_buf;
         if (cpu_data_buf[old_cpu_data_buf].time_stamp > 0) {
             uint64_t idle_ticks = 0;
-            int cpu = 0;
             int num_lcpus = NUM_IDS_IN_LIST(node[node_ix].cpu_list_p);
-            int num_cpus_to_process = num_lcpus;
-            while (num_cpus_to_process) {
+            // Bound by cpu_id_limit rather than counting down the number of
+            // set bits: idle[] is indexed by CPU ID, and a count-driven loop
+            // walks past the end of the array if the CPU list and the
+            // allocation ever disagree.
+            for (int cpu = 0; (cpu < cpu_id_limit); cpu++) {
                 if (ID_IS_IN_LIST(cpu, node[node_ix].cpu_list_p)) {
-                    idle_ticks += cpu_data_buf[cur_cpu_data_buf].idle[cpu]
-                                - cpu_data_buf[old_cpu_data_buf].idle[cpu];
-                    num_cpus_to_process -= 1;
+                    uint64_t cur_idle = cpu_data_buf[cur_cpu_data_buf].idle[cpu];
+                    uint64_t old_idle = cpu_data_buf[old_cpu_data_buf].idle[cpu];
+                    // Idle ticks are monotonic, but a CPU that went offline and
+                    // came back resets them.  Clamp instead of underflowing.
+                    if (cur_idle >= old_idle) {
+                        idle_ticks += (cur_idle - old_idle);
+                    }
                 }
-                cpu += 1;
             }
             uint64_t time_diff = cpu_data_buf[cur_cpu_data_buf].time_stamp
                                - cpu_data_buf[old_cpu_data_buf].time_stamp;
             // printf("Node: %d   CPUs: %ld   time diff %ld   Idle ticks %ld\n", node_id, node[node_ix].CPUs_total, time_diff, idle_ticks);
-	    if (time_diff == 0) {
-		numad_log(LOG_WARNING, "Forcing time_diff to be 1\n");
-		time_diff = 1;
-	    }
+            if (time_diff == 0) {
+                numad_log(LOG_WARNING, "Forcing time_diff to be 1\n");
+                time_diff = 1;
+            }
             node[node_ix].CPUs_free = (idle_ticks * ONE_HUNDRED) / time_diff;
             // Possibly discount hyper-threads
             if ((threads_per_core > 1) && (current_htt_percent < 100)) {
@@ -3160,7 +3433,7 @@ int all_digits(const struct dirent *dptr) {
         return 0;
     }
     while (*p != '\0') {
-        if (!isdigit(*p++)) return 0;
+        if (!isdigit((unsigned char)*p++)) return 0;
     }
     return 1;
 }
@@ -3179,15 +3452,15 @@ typedef struct stat_data {
     int tty_nr;
     int tpgid;
     unsigned flags;
-#define PF_VCPU			0x00000001	/* I'm a virtual CPU */
-#define PF_IDLE			0x00000002	/* I am an IDLE thread */
-#define PF_EXITING		0x00000004	/* Getting shut down */
-#define PF_POSTCOREDUMP		0x00000008	/* Coredumps should ignore this task */
-#define PF_IO_WORKER		0x00000010	/* Task is an IO worker */
-#define PF_WQ_WORKER		0x00000020	/* I'm a workqueue worker */
-#define PF_FORKNOEXEC		0x00000040	/* Forked but didn't exec */
-#define PF_MCE_PROCESS		0x00000080      /* Process policy on mce errors */
-#define PF_SUPERPRIV		0x00000100	/* Used super-user privileges */
+#define PF_VCPU                 0x00000001      /* I'm a virtual CPU */
+#define PF_IDLE                 0x00000002      /* I am an IDLE thread */
+#define PF_EXITING              0x00000004      /* Getting shut down */
+#define PF_POSTCOREDUMP         0x00000008      /* Coredumps should ignore this task */
+#define PF_IO_WORKER            0x00000010      /* Task is an IO worker */
+#define PF_WQ_WORKER            0x00000020      /* I'm a workqueue worker */
+#define PF_FORKNOEXEC           0x00000040      /* Forked but didn't exec */
+#define PF_MCE_PROCESS          0x00000080      /* Process policy on mce errors */
+#define PF_SUPERPRIV            0x00000100      /* Used super-user privileges */
     uint64_t minflt;
     uint64_t cminflt;
     uint64_t majflt;
@@ -3324,12 +3597,14 @@ int get_stat_data_for_pid(int pid, process_data_p out) {
         return -1;
     }
     p += 18;
-    while ((*p != '\0') && (!isdigit(*p))) {
+    while ((*p != '\0') && (!isdigit((unsigned char)*p))) {
         p++;
     }
     add_ids_to_list_from_str(tmp_cpu_list_p, p);
-    for (int cpu = 0; (cpu < num_cpus); cpu++) {
-        if (ID_IS_IN_LIST(cpu, tmp_cpu_list_p) && (cpu_to_node_ix[cpu] >= 0)) {
+    // Iterate over CPU IDs, so bound by cpu_id_limit rather than num_cpus.
+    for (int cpu = 0; (cpu < cpu_id_limit); cpu++) {
+        if ((cpu_to_node_ix != NULL)
+            && ID_IS_IN_LIST(cpu, tmp_cpu_list_p) && (cpu_to_node_ix[cpu] >= 0)) {
             ADD_ID_TO_LIST(cpu_to_node_ix[cpu], out->node_list_p);
         }
     }
@@ -3535,6 +3810,16 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, id_list_p previous_n
                 memset(from_mask, 0, num_bytes_in_masks);
                 int from_node_id = node_id_from_ix(max_from_node_ix);
                 int dest_node_id = node_id_from_ix(min_dest_node_ix);
+                // SET_BIT() has no bounds check: a node ID at or beyond the
+                // mask width would corrupt memory past the allocation.
+                if ((from_node_id < 0) || (dest_node_id < 0)
+                    || ((unsigned long)from_node_id >= migrate_maxnode)
+                    || ((unsigned long)dest_node_id >= migrate_maxnode)) {
+                    numad_log(LOG_WARNING,
+                              "Skipping migration for PID %d: node ID %d/%d outside migrate_pages mask width %lu\n",
+                              p->pid, from_node_id, dest_node_id, migrate_maxnode);
+                    break;
+                }
                 SET_BIT(from_node_id, from_mask);
                 SET_BIT(dest_node_id, dest_mask);
 #if defined(__NR_migrate_pages)
@@ -3555,6 +3840,8 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, id_list_p previous_n
                         size_t refreshed_num_bytes = migrate_mask_bytes(refreshed_maxnode);
                         if ((refreshed_maxnode > 0)
                             && (refreshed_num_bytes > 0)
+                            && ((unsigned long)from_node_id < refreshed_maxnode)
+                            && ((unsigned long)dest_node_id < refreshed_maxnode)
                             && ((refreshed_maxnode != migrate_maxnode)
                                 || (refreshed_num_bytes != num_bytes_in_masks))) {
                             ensure_migrate_masks(refreshed_num_bytes, &dest_mask, &from_mask,
@@ -3577,27 +3864,39 @@ int bind_process_and_maybe_migrate_memory(process_data_p p, id_list_p previous_n
                             }
                         }
                     }
-                    // Check errno
+                    // Check errno.  CPU affinity has already been applied to
+                    // every task above, so we must not bail out of the function
+                    // here: that would skip the bind_time_stamp update and
+                    // re-evaluate this process every cycle with no cooldown --
+                    // a persistent EPERM (migrate_pages denied in a container)
+                    // would then rebind it forever.  Give up on migration only,
+                    // and let the /proc liveness check below decide whether the
+                    // process is really gone.
+                    migration_possible = 0;
                     if (errno == ESRCH) {
                         numad_log(LOG_WARNING, "Tried to move PID %d, but it apparently went away.\n", p->pid);
-                        return 0;  // Assume the process terminated
-                    }
-                    if (errno == EFAULT) {
+                        snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                                 "process disappeared during migrate_pages");
+                    } else if (errno == EFAULT) {
                         numad_log(LOG_WARNING, "Tried to move PID %d, but some memory was out of range.\n", p->pid);
-                        return 0;  // Assume the process terminated
-                    }
-                    if (errno == EINVAL) {
+                        snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                                 "migrate_pages reported memory out of range");
+                    } else if (errno == EINVAL) {
                         numad_log(LOG_WARNING,
                                   "Tried to move PID %d from node %d to node %d, but migrate_pages(maxnode=%lu, mask_bytes=%zu) returned EINVAL.\n",
                                   p->pid, from_node_id, dest_node_id, migrate_maxnode, num_bytes_in_masks);
-                        return 0;  // Assume the process terminated
-                    }
-                    if (errno == EPERM) {
+                        snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                                 "migrate_pages rejected the node mask (EINVAL)");
+                    } else if (errno == EPERM) {
                         numad_log(LOG_WARNING, "Tried to move PID %d, but there is insufficient privilege.\n", p->pid);
-                        return 0;  // Assume the process terminated
+                        snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                                 "insufficient privilege for migrate_pages");
+                    } else {
+                        numad_log(LOG_WARNING, "Tried to move PID %d, but migrate_pages failed with errno %d.\n", p->pid, errno);
+                        snprintf(runtime_migrate_reason, sizeof(runtime_migrate_reason),
+                                 "migrate_pages failed with errno %d", errno);
                     }
-                    numad_log(LOG_WARNING, "Tried to move PID %d, but migrate_pages failed with errno %d.\n", p->pid, errno);
-                    return 0;
+                    break;
                 }
 #else
                 migration_possible = 0;
@@ -3623,11 +3922,13 @@ migrate_pages_success:
         p->bind_time_stamp = t1;
         remember_last_bound_target_with_history(p, previous_node_list_p, t1);
         if (affinity_errors > 0) {
-            numad_log(LOG_WARNING, "PID %d affinity target node(s) %s applied with %d task affinity error(s) in %d.%d seconds\n",
-                      p->pid, node_list_str, affinity_errors, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
+            numad_log(LOG_WARNING, "PID %d affinity target node(s) %s applied with %d task affinity error(s) in %lu.%02lu seconds\n",
+                      p->pid, node_list_str, affinity_errors,
+                      (unsigned long)((t_affinity - t0) / 100), (unsigned long)((t_affinity - t0) % 100));
         } else {
-            numad_log(LOG_NOTICE, "PID %d affinity applied to node(s) %s in %d.%d seconds\n",
-                      p->pid, node_list_str, (t_affinity - t0) / 100, (t_affinity - t0) % 100);
+            numad_log(LOG_NOTICE, "PID %d affinity applied to node(s) %s in %lu.%02lu seconds\n",
+                      p->pid, node_list_str,
+                      (unsigned long)((t_affinity - t0) / 100), (unsigned long)((t_affinity - t0) % 100));
         }
         if (!migration_requested) {
             numad_log(LOG_NOTICE, "PID %d memory migration skipped: %s\n", p->pid,
@@ -3640,14 +3941,14 @@ migrate_pages_success:
                       p->pid, node_list_str);
         } else if (migration_partial_pages > 0) {
             numad_log(LOG_NOTICE,
-                      "PID %d memory migration partial toward node(s) %s: %d pages could not be moved across %d pass(es) in %d.%d seconds\n",
+                      "PID %d memory migration partial toward node(s) %s: %d pages could not be moved across %d pass(es) in %lu.%02lu seconds\n",
                       p->pid, node_list_str, migration_partial_pages, migration_passes,
-                      (t1 - t_affinity) / 100, (t1 - t_affinity) % 100);
+                      (unsigned long)((t1 - t_affinity) / 100), (unsigned long)((t1 - t_affinity) % 100));
         } else {
             numad_log(LOG_NOTICE,
-                      "PID %d memory migration completed toward node(s) %s across %d pass(es) in %d.%d seconds\n",
+                      "PID %d memory migration completed toward node(s) %s across %d pass(es) in %lu.%02lu seconds\n",
                       p->pid, node_list_str, migration_passes,
-                      (t1 - t_affinity) / 100, (t1 - t_affinity) % 100);
+                      (unsigned long)((t1 - t_affinity) / 100), (unsigned long)((t1 - t_affinity) % 100));
         }
         return 1;
     }
@@ -3764,14 +4065,21 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
             p->process_MBs[ix] /= MEGABYTE;
             if ((current_log_level >= LOG_DEBUG) && (p->process_MBs[ix] > 0)) {
                 if (ix == num_nodes) {
-                    numad_log(LOG_DEBUG, "Interleaved MBs: %ld\n", ix, p->process_MBs[ix]);
+                    numad_log(LOG_DEBUG, "Interleaved MBs: %lu\n",
+                              (unsigned long)p->process_MBs[ix]);
                 } else {
-                    numad_log(LOG_DEBUG, "PROCESS_MBs[node %d]: %ld\n", node_id_from_ix(ix), p->process_MBs[ix]);
+                    numad_log(LOG_DEBUG, "PROCESS_MBs[node %d]: %lu\n",
+                              node_id_from_ix(ix), (unsigned long)p->process_MBs[ix]);
                 }
             }
             if ((ix < num_nodes) && ID_IS_IN_LIST(ix, p->node_list_p)) {
                 proc_avg_node_CPUs_free += node[ix].CPUs_free;
             }
+        }
+        // Guard against a stale hash entry with no node list: the division
+        // below would be by zero.
+        if ((p->node_list_p == NULL) || (NUM_IDS_IN_LIST(p->node_list_p) == 0)) {
+            return NULL;
         }
         proc_avg_node_CPUs_free /= NUM_IDS_IN_LIST(p->node_list_p);
         if ((process_has_interleaved_memory) && (current_keep_interleaved_memory)) {
@@ -3792,9 +4100,10 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     tmp_node = checked_realloc(tmp_node, num_nodes * sizeof(node_data_t), "tmp_node");
     memcpy(tmp_node, node, num_nodes * sizeof(node_data_t) );
     // Adjust how many MBs and CPUs are available per node and calculate the node magnitude
-    uint64_t sum_of_node_CPUs_free = 0;
     for (int ix = 0;  (ix < num_nodes);  ix++) {
-        if (pid > 0) {
+        // Test p, not pid: a positive pid that missed the hash lookup leaves p
+        // NULL, and every dereference below would fault.
+        if (p != NULL) {
             if (NUM_IDS_IN_LIST(p->node_list_p) < num_nodes) {
                 // If the process is currently bound running on less than all the
                 // nodes, first add back (biased) memory already used by this
@@ -3804,7 +4113,10 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
                 if (ID_IS_IN_LIST(ix, p->node_list_p)) {
                     tmp_node[ix].CPUs_free = proc_avg_node_CPUs_free;
                     if (assume_enough_cpus) {
-                        long overage = ((tmp_node[ix].active_threads * 100) - tmp_node[ix].CPUs_total);
+                        uint64_t overage = 0;
+                        if (tmp_node[ix].CPUs_total < (tmp_node[ix].active_threads * 100)) {
+                            overage = (tmp_node[ix].active_threads * 100) - tmp_node[ix].CPUs_total;
+                        }
                         if (overage > 0) {
                             if (current_log_level >= LOG_DEBUG) {
                                 numad_log(LOG_DEBUG, "Reducing Node[%d] CPUs_free by %ld.\n", ix, overage);
@@ -3827,7 +4139,6 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
             if (tmp_node[ix].CPUs_free > tmp_node[ix].CPUs_total) {
                 tmp_node[ix].CPUs_free = tmp_node[ix].CPUs_total;
             }
-            sum_of_node_CPUs_free += tmp_node[ix].CPUs_free;
             if (tmp_node[ix].MBs_free > tmp_node[ix].MBs_total) {
                 tmp_node[ix].MBs_free = tmp_node[ix].MBs_total;
             }
@@ -3853,7 +4164,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     // CPUs needed.  Instead, err on the side of providing too many resources.
     int cpu_flex = 0;
     if (pid > 0) {
-        if (current_target_utilization < 100) {
+        if ((current_target_utilization < 100) && (num_nodes > 0)) {
             // Is half of the utilization margin a good amount of CPU flexing?
             cpu_flex = ((100 - current_target_utilization) * node[0].CPUs_total) / 200;
         } else {
@@ -3913,10 +4224,13 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
                 continue;
             }
             int dist = tmp_node[index[ij]].distance[ix];
-            totmag[ix] += (tmp_node[index[ij]].magnitude / (dist * dist));
+            if (dist < 1) {
+                dist = 10;  // never divide by zero
+            }
+            totmag[ix] += (tmp_node[index[ij]].magnitude / ((uint64_t)dist * (uint64_t)dist));
         }
         if (current_log_level >= LOG_DEBUG) {
-            numad_log(LOG_DEBUG, "Totmag[%d]: %ld\n", ix, totmag[ix]);
+            numad_log(LOG_DEBUG, "Totmag[%d]: %lu\n", ix, (unsigned long)totmag[ix]);
         }
     }
 
@@ -3979,7 +4293,8 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
             numad_log(LOG_DEBUG, "MBs: %d,  CPUs: %d\n", mbs, cpus);
         }
         if (tmp_node[index[ix]].CPUs_free > 10) {
-            numad_log(LOG_DEBUG, "Assigning resources from node %d\n", tmp_node[index[ix]].node_id);
+            numad_log(LOG_DEBUG, "Assigning resources from node %d\n",
+                      node_id_from_ix(index[ix]));
             ADD_ID_TO_LIST(index[ix], target_node_list_p);
         }
         if (EQUAL_LISTS(target_node_list_p, all_nodes_list_p)) {
@@ -3989,7 +4304,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
         // "Consume" the resources on this node
 #define CPUS_MARGIN 0
 #define MBS_MARGIN 100
-        if (tmp_node[index[ix]].MBs_free >= (mbs + MBS_MARGIN)) {
+        if ((mbs + MBS_MARGIN) > 0 && tmp_node[index[ix]].MBs_free >= (uint64_t)(mbs + MBS_MARGIN)) {
             tmp_node[index[ix]].MBs_free -= mbs;
             mbs = 0;
         } else {
@@ -3998,7 +4313,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
             }
             tmp_node[index[ix]].MBs_free = MBS_MARGIN;
         }
-        if (tmp_node[index[ix]].CPUs_free >= (cpus + CPUS_MARGIN)) {
+        if ((cpus + CPUS_MARGIN) > 0 && tmp_node[index[ix]].CPUs_free >= (uint64_t)(cpus + CPUS_MARGIN)) {
             tmp_node[index[ix]].CPUs_free -= cpus;
             cpus = 0;
         } else {
@@ -4067,7 +4382,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
         numad_log(LOG_WARNING, "Empty target node list -- using all nodes.\n");
         COPY_LIST(all_nodes_list_p, target_node_list_p);
     }
-  
+
     // Log advice, and return target node list
     int target_matches_current = 0;
     if ((pid > 0) && (p != NULL) && (p->bind_time_stamp)
@@ -4080,7 +4395,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     char buf2[BUF_SIZE];
     str_from_node_ix_list_as_node_ids(buf2, BUF_SIZE, target_node_list_p);
     char *cmd_name = "(unknown)";
-    if ((p) && (p->comm)) {
+    if (p) {
         cmd_name = p->comm;
     }
     if (!target_matches_current) {
@@ -4088,7 +4403,7 @@ static id_list_p pick_numa_nodes_core(int pid, int cpus, int mbs, int assume_eno
     } else {
         numad_log(LOG_DEBUG, "PID %d %s target node(s) unchanged (%s)\n", pid, cmd_name, buf2);
     }
-    if (pid > 0) {
+    if ((p != NULL) && (p->node_list_p != NULL)) {
         COPY_LIST(target_node_list_p, p->node_list_p);
     }
     return target_node_list_p;
@@ -4288,8 +4603,8 @@ int manage_loads() {
             process_data_p p = pindex[ix];
             char buf[BUF_SIZE];
             str_from_node_ix_list_as_node_ids(buf, BUF_SIZE, p->node_list_p);
-            fprintf(dest, "Timestamp %ld PID %d %s, Flags %x, Threads %ld/%ld, CPU %ld, MBs %ld/%ld, Magnitude %ld, Node(s) %s\n", 
-                p->data_time_stamp, p->pid, p->comm, p->flags, p->num_active_threads, p->num_threads, 
+            fprintf(dest, "Timestamp %ld PID %d %s, Flags %x, Threads %ld/%ld, CPU %ld, MBs %ld/%ld, Magnitude %ld, Node(s) %s\n",
+                p->data_time_stamp, p->pid, p->comm, p->flags, p->num_active_threads, p->num_threads,
                 p->CPUs_used, p->MBs_used, p->MBs_size, process_effective_magnitude_now(p, time_stamp), buf);
         }
         fflush(dest);
@@ -4338,8 +4653,11 @@ int manage_loads() {
         }
         int mb_request  = (p->MBs_used  * 100) / mem_target_utilization;
         int cpu_request = (p->CPUs_used * 100) / cpu_target_utilization;
-        if (cpu_request > p->num_active_threads * 100) {
-            cpu_request = p->num_active_threads * 100;
+        // num_active_threads * 100 can exceed INT_MAX for huge thread counts;
+        // clamp via int64 to avoid the comparison wrapping.
+        uint64_t max_cpu_request = p->num_active_threads * 100;
+        if ((uint64_t)cpu_request > max_cpu_request) {
+            cpu_request = (int)MIN(max_cpu_request, (uint64_t)INT_MAX);
         }
         int boosted = 0;
         int kvm_vcpu_threads = 0;
@@ -4351,7 +4669,7 @@ int manage_loads() {
                 cpu_request = kvm_vcpu_threads * 100;
             }
         }
-        
+
         // Check RAM and CPU margin on nodes where PID currently bound
         uint64_t node_MBs_free = 0;
         uint64_t node_MBs_total = 0;
@@ -4389,16 +4707,16 @@ int manage_loads() {
                 mb_request = (p->MBs_used * 100) / mem_target_utilization;
             }
             // If not a KVM guest and process might be artificially constrained
-            if ( (kvm_vcpu_threads == 0) 
-                && (cpu_request < p->num_active_threads * 100)
+            if ( (kvm_vcpu_threads == 0)
+                && ((uint64_t)cpu_request < p->num_active_threads * 100)
                 && (node_CPUs_free < 80) ) {
                     boosted = 1;
-                    cpu_request = p->num_active_threads * 100;
+                    cpu_request = (int)MIN(p->num_active_threads * 100, (uint64_t)INT_MAX);
             }
 
             // FIXME: worry about balance here?
             // if (ID_IS_IN_LIST(min_node_CPUs_free_id, p->node_list_p) || ID_IS_IN_LIST(min_node_MBs_free_id, p->node_list_p))
-           
+
         } // bound process
 
         // See if there should be enough cores
@@ -4471,15 +4789,21 @@ int manage_loads() {
                 }
                 COPY_LIST(current_node_list_p, p->node_list_p);
             } else if (same_target_within_cooldown && !current_matches_last_bound) {
-                if (current_log_level >= LOG_DEBUG) {
-                    char current_buf[BUF_SIZE];
-                    char target_buf[BUF_SIZE];
-                    str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
-                    str_from_node_ix_list_as_node_ids(target_buf, BUF_SIZE, node_list_p);
-                    numad_log(LOG_DEBUG,
-                              "PID %d %s current affinity drifted from last successful target; reapplying node(s) (%s) from current node(s) (%s) despite cooldown.\n",
-                              p->pid, process_comm_name(p), target_buf, current_buf);
-                }
+                // The process drifted away from its last successful target.
+                // Restore that target now, even though the cooldown is still
+                // active, instead of merely logging that we would.
+                char current_buf[BUF_SIZE];
+                char target_buf[BUF_SIZE];
+                str_from_node_ix_list_as_node_ids(current_buf, BUF_SIZE, current_node_list_p);
+                str_from_node_ix_list_as_node_ids(target_buf, BUF_SIZE, node_list_p);
+                numad_log(LOG_NOTICE,
+                          "PID %d %s current affinity drifted from last successful target; reapplying node(s) (%s) from current node(s) (%s) despite cooldown.\n",
+                          p->pid, process_comm_name(p), target_buf, current_buf);
+                char migrate_reason[BUF_SIZE];
+                int migrate_memory = should_migrate_process_memory(p, migrate_reason,
+                                                                   sizeof(migrate_reason));
+                rc = bind_process_and_maybe_migrate_memory(p, current_node_list_p,
+                                                           migrate_memory, migrate_reason);
             } else if (scx_mode == SCX_MODE_OBSERVE) {
                 numad_log(LOG_NOTICE, "SCX observe mode: PID %d would be rebound now\n", p->pid);
                 COPY_LIST(current_node_list_p, p->node_list_p);
@@ -4540,7 +4864,7 @@ int manage_loads() {
 
 
 void *set_dynamic_options(void *arg) {
-    // int arg_value = *(int *)arg;
+    (void)arg;  // thread entry: no argument needed
     char buf[BUF_SIZE];
     for (;;) {
         // Loop here forever waiting for a msg to do something...
@@ -4556,16 +4880,38 @@ void *set_dynamic_options(void *arg) {
             }
             break;
         case 'H':
-            store_int_relaxed(&thp_scan_sleep_ms, msg.body.arg1);
+            // Mirror the "-H" startup validation: 0 keeps the system default,
+            // otherwise the kernel tunable expects 10..1000000 ms.
+            if ((msg.body.arg1 != 0)
+                && ((msg.body.arg1 < 10) || (msg.body.arg1 > 1000000))) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid THP scan_sleep_ms request %ld (need 0, or 10..1000000)\n",
+                          msg.body.arg1);
+                break;
+            }
+            store_int_relaxed(&thp_scan_sleep_ms, (int)msg.body.arg1);
             set_thp_scan_sleep_ms(READ_INT_SETTING(thp_scan_sleep_ms));
             break;
         case 'i':
-            store_int_relaxed(&min_interval, msg.body.arg1);
-            store_int_relaxed(&max_interval, msg.body.arg2);
-            if (READ_INT_SETTING(max_interval) <= 0) {
+            // max_interval == 0 means "shut down".  Otherwise reject values
+            // that would busy-loop or inverted ranges, and keep the previous
+            // setting rather than corrupting the daemon's pacing.
+            if (msg.body.arg2 == 0) {
+                store_int_relaxed(&min_interval, (int)msg.body.arg1);
+                store_int_relaxed(&max_interval, 0);
                 shut_down_numad();
+                break;
             }
-            numad_log(LOG_NOTICE, "Changing interval to %d:%d\n", msg.body.arg1, msg.body.arg2);
+            if ((msg.body.arg1 < 1) || (msg.body.arg2 < msg.body.arg1)
+                || (msg.body.arg1 > INT_MAX) || (msg.body.arg2 > INT_MAX)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid interval request %ld:%ld (need 1 <= min <= max)\n",
+                          msg.body.arg1, msg.body.arg2);
+                break;
+            }
+            store_int_relaxed(&min_interval, (int)msg.body.arg1);
+            store_int_relaxed(&max_interval, (int)msg.body.arg2);
+            numad_log(LOG_NOTICE, "Changing interval to %ld:%ld\n", msg.body.arg1, msg.body.arg2);
             break;
         case 'K':
             store_int_relaxed(&keep_interleaved_memory, (msg.body.arg1 != 0));
@@ -4576,22 +4922,37 @@ void *set_dynamic_options(void *arg) {
             }
             break;
         case 'l':
-            numad_log(LOG_NOTICE, "Changing log level to %d\n", msg.body.arg1);
-            store_int_relaxed(&log_level, msg.body.arg1);
+            // syslog levels are 0..7; anything else would silently disable or
+            // spam logging.
+            if ((msg.body.arg1 < LOG_EMERG) || (msg.body.arg1 > LOG_DEBUG)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid log level request %ld (need %d..%d)\n",
+                          msg.body.arg1, LOG_EMERG, LOG_DEBUG);
+                break;
+            }
+            numad_log(LOG_NOTICE, "Changing log level to %ld\n", msg.body.arg1);
+            store_int_relaxed(&log_level, (int)msg.body.arg1);
             break;
         case 'm':
-            numad_log(LOG_NOTICE, "Changing target memory locality to %d\n", msg.body.arg1);
-            store_int_relaxed(&target_memlocality, msg.body.arg1);
+            // Same bounds the "-m" option enforces at startup.
+            if ((msg.body.arg1 < 50) || (msg.body.arg1 > 100)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid target memory locality request %ld (need 50..100)\n",
+                          msg.body.arg1);
+                break;
+            }
+            numad_log(LOG_NOTICE, "Changing target memory locality to %ld\n", msg.body.arg1);
+            store_int_relaxed(&target_memlocality, (int)msg.body.arg1);
             break;
         case 'p':
-            numad_log(LOG_NOTICE, "Adding PID %d to inclusion PID list\n", msg.body.arg1);
+            numad_log(LOG_NOTICE, "Adding PID %ld to inclusion PID list\n", msg.body.arg1);
             pthread_mutex_lock(&pid_list_mutex);
             exclude_pid_list = remove_pid_from_pid_list(exclude_pid_list, msg.body.arg1);
             include_pid_list = insert_pid_into_pid_list(include_pid_list, msg.body.arg1);
             pthread_mutex_unlock(&pid_list_mutex);
             break;
         case 'r':
-            numad_log(LOG_NOTICE, "Removing PID %d from explicit PID lists\n", msg.body.arg1);
+            numad_log(LOG_NOTICE, "Removing PID %ld from explicit PID lists\n", msg.body.arg1);
             pthread_mutex_lock(&pid_list_mutex);
             include_pid_list = remove_pid_from_pid_list(include_pid_list, msg.body.arg1);
             exclude_pid_list = remove_pid_from_pid_list(exclude_pid_list, msg.body.arg1);
@@ -4606,34 +4967,57 @@ void *set_dynamic_options(void *arg) {
             }
             break;
         case 't':
-            numad_log(LOG_NOTICE, "Changing logical CPU thread percent to %d\n", msg.body.arg1);
-            store_int_relaxed(&htt_percent, msg.body.arg1);
+            // Same bounds the "-t" option enforces at startup.
+            if ((msg.body.arg1 < 0) || (msg.body.arg1 > 100)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid logical CPU thread percent request %ld (need 0..100)\n",
+                          msg.body.arg1);
+                break;
+            }
+            numad_log(LOG_NOTICE, "Changing logical CPU thread percent to %ld\n", msg.body.arg1);
+            store_int_relaxed(&htt_percent, (int)msg.body.arg1);
             node_info_time_stamp = 0; // to force rescan of nodes/cpus soon
             break;
         case 'u':
-            numad_log(LOG_NOTICE, "Changing target utilization to %d\n", msg.body.arg1);
-            store_int_relaxed(&target_utilization, msg.body.arg1);
+            // Same bounds the "-u" option enforces at startup.  A zero here
+            // would divide by zero in manage_loads().
+            if ((msg.body.arg1 < 10) || (msg.body.arg1 > 130)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid target utilization request %ld (need 10..130)\n",
+                          msg.body.arg1);
+                break;
+            }
+            numad_log(LOG_NOTICE, "Changing target utilization to %ld\n", msg.body.arg1);
+            store_int_relaxed(&target_utilization, (int)msg.body.arg1);
             break;
         case 'w':
-            numad_log(LOG_NOTICE, "Getting NUMA pre-placement advice for %d CPUs and %d MBs\n",
+            numad_log(LOG_NOTICE, "Getting NUMA pre-placement advice for %ld CPUs and %ld MBs\n",
                                     msg.body.arg1, msg.body.arg2);
+            if ((msg.body.arg1 < 0) || (msg.body.arg1 > INT_MAX)
+                || (msg.body.arg2 < 0) || (msg.body.arg2 > INT_MAX)) {
+                numad_log(LOG_WARNING,
+                          "Ignoring invalid pre-placement request %ld:%ld\n",
+                          msg.body.arg1, msg.body.arg2);
+                send_msg(msg.body.src_pid, 'w', 0, 0, "");
+                break;
+            }
             pthread_mutex_lock(&node_info_mutex);
             update_nodes();
-            id_list_p node_list_p = pick_numa_nodes(-1, msg.body.arg1, msg.body.arg2, 0);
+            id_list_p node_list_p = pick_numa_nodes(-1, (int)msg.body.arg1, (int)msg.body.arg2, 0);
             str_from_node_ix_list_as_node_ids(buf, BUF_SIZE, node_list_p);
             pthread_mutex_unlock(&node_info_mutex);
             send_msg(msg.body.src_pid, 'w', 0, 0, buf);
             break;
         case 'x':
-            numad_log(LOG_NOTICE, "Adding PID %d to exclusion PID list\n", msg.body.arg1);
+            numad_log(LOG_NOTICE, "Adding PID %ld to exclusion PID list\n", msg.body.arg1);
             pthread_mutex_lock(&pid_list_mutex);
             include_pid_list = remove_pid_from_pid_list(include_pid_list, msg.body.arg1);
             exclude_pid_list = insert_pid_into_pid_list(exclude_pid_list, msg.body.arg1);
             pthread_mutex_unlock(&pid_list_mutex);
             break;
         default:
-            numad_log(LOG_WARNING, "Unexpected msg command: %c %d %d %s from PID %d\n",
-                                    msg.body.cmd, msg.body.arg1, msg.body.arg1, msg.body.text,
+            numad_log(LOG_WARNING, "Unexpected msg command: %c %ld %ld %s from PID %ld\n",
+                                    (int)msg.body.cmd, msg.body.arg1, msg.body.arg2, msg.body.text,
                                     msg.body.src_pid);
             break;
         }
@@ -4654,12 +5038,12 @@ void parse_two_arg_values(char *p, int *first_ptr, int *second_ptr, int first_is
     }
     if (*p == '.') {
         p++;
-        while ((first_scale_digits > 0) && (isdigit(*p))) {
+        while ((first_scale_digits > 0) && (isdigit((unsigned char)*p))) {
             first *= 10;
             first += (*p++ - '0');
             first_scale_digits -= 1;
         }
-        while (isdigit(*p)) { p++; }
+        while (isdigit((unsigned char)*p)) { p++; }
     }
     while (first_scale_digits > 0) {
         first *= 10;
@@ -4982,6 +5366,15 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
     if (i_flag) {
+        // max_interval == 0 is the documented "shut the daemon down" request
+        // ("numad -i 0" or "numad -i 0:0"), so both intervals may be zero on
+        // that path.  A zero min_interval with a non-zero max_interval is not:
+        // manage_loads() would return it and turn sleep(interval) into a
+        // /proc-scanning busy loop.
+        if ((min_interval < 1) && (max_interval != 0)) {
+            fprintf(stderr, "Min interval (%d) must be at least 1 second\n", min_interval);
+            exit(EXIT_FAILURE);
+        }
         if ((max_interval < min_interval) && (max_interval != 0)) {
             fprintf(stderr, "Max interval (%d) must be greater than min interval (%d)\n", max_interval, min_interval);
             exit(EXIT_FAILURE);
@@ -4991,6 +5384,7 @@ int main(int argc, char *argv[]) {
     open_log_file();
     init_msg_queue();
     num_cpus = get_num_cpus();
+    cpu_id_limit = get_cpu_id_limit();
     page_size_in_bytes = sysconf(_SC_PAGESIZE);
     huge_page_size_in_bytes = get_huge_page_size_in_bytes();
     // Figure out if this is the daemon, or a subsequent invocation
@@ -5004,7 +5398,7 @@ int main(int argc, char *argv[]) {
         }
         // Daemon is already running.  So send dynamic options to persistant
         // thread to handle requests, get the response (if any), and finish.
-        msg_t msg; 
+        msg_t msg;
         if (C_flag) {
             send_msg(daemon_pid, 'C', use_inactive_file_cache, 0, "");
         }
@@ -5076,7 +5470,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_SUCCESS);
     } else if (max_interval > 0) {
         // Start the numad daemon...
-        check_prereqs(argv[0]);
+        check_prereqs();
 #if (!NO_DAEMON)
         // Daemonize self...
         daemon_pid = fork();
@@ -5101,7 +5495,7 @@ int main(int argc, char *argv[]) {
 #endif
         // Set up signal handlers
         struct sigaction sa;
-        memset(&sa, 0, sizeof(sa)); 
+        memset(&sa, 0, sizeof(sa));
         sa.sa_handler = sig_handler;
         if (sigaction(SIGHUP, &sa, NULL)
             || sigaction(SIGTERM, &sa, NULL)
@@ -5113,7 +5507,19 @@ int main(int argc, char *argv[]) {
         process_hash_table_expand();
         // Spawn a thread to handle messages from subsequent invocation requests
         pthread_mutex_init(&pid_list_mutex, NULL);
-        pthread_mutex_init(&node_info_mutex, NULL);
+        // node_info_mutex is recursive: the main loop holds it across a whole
+        // cycle (so node[] cannot be reallocated out from under
+        // update_processes()/manage_loads()), while manage_loads() still takes
+        // it around each bind.  Without recursion that inner lock would
+        // self-deadlock.
+        pthread_mutexattr_t node_info_mutex_attr;
+        if ((pthread_mutexattr_init(&node_info_mutex_attr) != 0)
+            || (pthread_mutexattr_settype(&node_info_mutex_attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+            || (pthread_mutex_init(&node_info_mutex, &node_info_mutex_attr) != 0)) {
+            numad_log(LOG_CRIT, "Could not initialize node_info_mutex\n");
+            exit(EXIT_FAILURE);
+        }
+        pthread_mutexattr_destroy(&node_info_mutex_attr);
         pthread_attr_t attr;
         if (pthread_attr_init(&attr) != 0) {
             numad_log(LOG_CRIT, "pthread_attr_init failure\n");
@@ -5134,21 +5540,26 @@ int main(int argc, char *argv[]) {
         for (;;) {
             uint64_t cycle_ts = get_time_stamp();
             int interval = max_interval;
+            // Hold node_info_mutex for the whole cycle.  update_nodes() can
+            // realloc node[] and cpu_to_node_ix, so every reader of those
+            // (update_processes, manage_loads, the message thread's '-w'
+            // handler) must be serialized against it.  The mutex is recursive,
+            // so manage_loads()'s inner lock is a harmless re-entry.
             pthread_mutex_lock(&node_info_mutex);
             int nodes = update_nodes();
-            pthread_mutex_unlock(&node_info_mutex);
-            if (log_level >= LOG_INFO) {
+            if (READ_INT_SETTING(log_level) >= LOG_INFO) {
                 show_nodes(nodes);
             }
             int processes = update_processes(cycle_ts);
             update_gpu_processes(cycle_ts);
             refresh_scx_state();
-            if (log_level >= LOG_INFO) {
+            if (READ_INT_SETTING(log_level) >= LOG_INFO) {
                 show_processes(processes);
             }
             if (nodes > 1) {
                 interval = manage_loads();
             }
+            pthread_mutex_unlock(&node_info_mutex);
 #if (!NO_DAEMON)
             sleep(interval);
 #endif
@@ -5169,4 +5580,3 @@ int main(int argc, char *argv[]) {
     }
     exit(EXIT_SUCCESS);
 }
-
