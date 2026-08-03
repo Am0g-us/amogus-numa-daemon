@@ -8,17 +8,10 @@ BENCH_CFLAGS := -O3 -ffast-math -funroll-loops
 CFLAGS += ${OPT_CFLAGS}
 override CFLAGS += -I.
 
-# find out if compiler supports __thread
-THREAD_SUPPORT := $(shell if $(CC) $(CFLAGS) threadtest.c -o threadtest \
-			>/dev/null 2>/dev/null ; then echo "yes" ; else echo "no"; fi)
-ifeq ($(THREAD_SUPPORT),no)
-	override CFLAGS += -D__thread=""
-endif
-
 # find out if compiler supports -ftree-vectorize
-THREAD_SUPPORT := $(shell touch empty.c ; if $(CC) $(CFLAGS) -c -ftree-vectorize empty.c -o empty.o \
+VECTORIZE_SUPPORT := $(shell touch empty.c ; if $(CC) $(CFLAGS) -c -ftree-vectorize empty.c -o empty.o \
 			>/dev/null 2>/dev/null ; then echo "yes" ; else echo "no"; fi)
-ifeq ($(THREAD_SUPPORT),yes)
+ifeq ($(VECTORIZE_SUPPORT),yes)
 	BENCH_CFLAGS += -ftree-vectorize
 endif
 
@@ -52,13 +45,13 @@ RANLIB ?= ranlib
 
 install: numad
 	mkdir -p $(DESTDIR)${prefix}/bin
-	mkdir -p $(DESTDIR)/usr/libexec
+	mkdir -p $(DESTDIR)${prefix}/lib/numad
 	mkdir -p $(DESTDIR)${prefix}/share/man/man8
 	mkdir -p $(DESTDIR)${prefix}/lib/systemd/system
 	mkdir -p $(DESTDIR)/etc/init.d
 	mkdir -p $(DESTDIR)/etc
 	install -m 0755 numad $(DESTDIR)${prefix}/bin
-	install -m 0755 numad-wrapper $(DESTDIR)/usr/libexec
+	install -m 0755 numad-wrapper $(DESTDIR)${prefix}/lib/numad
 	install -m 0644 numad.service $(DESTDIR)${prefix}/lib/systemd/system/numad.service
 	install -m 0755 numad.init $(DESTDIR)/etc/init.d/numad
 	install -m 0644 numad.conf $(DESTDIR)/etc/numad.conf
@@ -69,7 +62,7 @@ clean:
 	@rm -rf html
 
 distclean: clean
-	rm -f .[^.]* */.[^.]*
+	rm -f .depend .depend.X
 	rm -f *~ */*~ *.orig */*.orig */*.rej *.rej 
 
 depend: .depend
@@ -77,7 +70,7 @@ depend: .depend
 .depend:
 	${CC} -MM -DDEPS_RUN -I. ${SOURCES} > .depend.X && mv .depend.X .depend
 
-include .depend
+-include .depend
 
 Makefile: .depend
 

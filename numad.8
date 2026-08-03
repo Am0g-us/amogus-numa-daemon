@@ -1,4 +1,4 @@
-.TH "numad" "8" "1.0.0" "Bill Gray" "Administration"
+.TH "numad" "8" "20251104" "Bill Gray" "Administration"
 .SH "NAME"
 .LP
 numad \- A user\-level daemon that provides placement advice and process
@@ -82,7 +82,7 @@ Display usage help information and then exit.
 \fB\-H\fR  <\fITHP_scan_sleep_ms\fP>
 Set the desired transparent hugepage scan interval in ms.  The
 .na
-/sys/kernel/mm/tranparent_hugepage/khugepaged/scan_sleep_millisecs
+/sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs
 .ad
 tunable is usually set to 10000ms by the operating system.  The default is
 changed by numad to be 1000ms since it is helpful for the hugepage daemon to be
@@ -97,9 +97,10 @@ Sets the time interval that numad waits between system scans, in seconds to
 <\fImax_interval\fP>. Default <\fImax_interval\fP> is 15 seconds, default
 <\fImin_interval\fP> is 5 seconds.  Setting a <\fImax_interval\fP> of zero will
 cause the daemon to exit.  (This is the normal mechanism to terminate the
-daemon.)  A bigger <\fImax_interval\fP> will decrease numad overhead but also
-decrease responsiveness to changing loads.  The default numad max_interval can
-be changed in the numad.conf file.
+daemon; with a daemon already running, both \fInumad \-i 0\fP and
+\fInumad \-i 0:0\fP work.)  A bigger <\fImax_interval\fP> will decrease numad
+overhead but also decrease responsiveness to changing loads.  The default numad
+max_interval can be changed in the numad.conf file.
 .TP
 \fB\-K\fR <\fI0|1\fP>
 This option controls whether numad keeps interleaved memory spread across NUMA
@@ -170,7 +171,7 @@ many workloads.  By default numad considers logical CPUs to be only 20 percent
 of a dedicated hardware core.
 .TP
 \fB\-u\fR  <\fItarget_utilization\fP>
-Set the desired maximum consumption percentage of a node. Default is 85%.
+Set the desired maximum consumption percentage of a node. Default is 90%.
 Decrease the target value to maintain more available resource margin on each
 node.  Increase the target value to more exhaustively consume node resources.
 If you have sized your workloads to precisely fit inside a NUMA node,
@@ -190,7 +191,8 @@ Display version information and exit.
 Queries numad for the best NUMA nodes to bind an entity that needs
 <\fINCPUS\fP>.  The amount of memory (in MBs) is optional, but should normally
 be specified as well <\fI:MB\fP> so numad can recommend NUMA nodes with
-available CPU capacity and adequate free memory.  This query option can be used
+available CPU capacity and adequate free memory.  The CPU count may include up
+to two decimal digits (e.g. \fI4.25:2000\fP).  This query option can be used
 regardless of whether numad is running as a daemon.  (An invocation using this
 option when numad is not running as a daemon, will not cause the daemon to
 start.) Output of this option is a string that contains a NUMA node list.  For
@@ -210,55 +212,65 @@ numad can manage.
 .SH "GPU AWARE OPTIONS"
 .TP
 \fB\-\-gpu-aware\fR=\fI0|1\fP
-Enable or disable AMD GPU-aware process tracking.  The current implementation
-uses DRM fdinfo process telemetry and sysfs topology data while preserving the
-legacy CPU-only path for processes without GPU activity.
+Enable or disable AMD GPU-aware process tracking (default 1).  The current
+implementation uses DRM fdinfo process telemetry and sysfs topology data while
+preserving the legacy CPU-only path for processes without GPU activity.
 .TP
 \fB\-\-gpu-backend\fR=\fIauto|fdinfo|amdsmi\fP
-Select the GPU telemetry backend.  The current production path uses DRM fdinfo.
-Requesting \fIamdsmi\fP currently emits a warning and falls back to the fdinfo
-collector; the AMD SMI process collector is not implemented yet.
+Select the GPU telemetry backend (default \fIauto\fP).  The current production
+path uses DRM fdinfo.  Requesting \fIamdsmi\fP currently emits a warning and
+falls back to the fdinfo collector; the AMD SMI process collector is not
+implemented yet.
 .TP
 \fB\-\-gpu-min-busy\fR=\fIPCT\fP
-Minimum GPU engine busy percentage required for automatic GPU-driven management.
-Discovering GPU topology alone does not make a process automatically manageable.
+Minimum GPU engine busy percentage required for automatic GPU-driven management
+(default 10).  Discovering GPU topology alone does not make a process
+automatically manageable.
 .TP
 \fB\-\-gpu-min-vram\fR=\fIMB\fP
-Minimum VRAM footprint in MB required for automatic GPU-driven management.
-Together with \fB\-\-gpu-min-busy\fR, this filters out tiny GPU users unless they
-are explicitly included.
+Minimum VRAM footprint in MB required for automatic GPU-driven management
+(default 256).  Together with \fB\-\-gpu-min-busy\fR, this filters out tiny GPU
+users unless they are explicitly included.
 .TP
 \fB\-\-gpu-fdinfo-discovery\fR=\fISECONDS\fP
-Interval in seconds between full DRM fdinfo discovery passes.
+Interval in seconds between full DRM fdinfo discovery passes (default 15).
 .TP
 \fB\-\-gpu-migrate\fR=\fIauto|always|never\fP
-Controls whether numad migrates memory for GPU-active workloads.  In auto mode,
-graphics-oriented GPU processes avoid aggressive memory migration and mainly have
-their CPU affinity adjusted unless \fIalways\fP is selected.
+Controls whether numad migrates memory for GPU-active workloads (default
+\fIauto\fR).  In auto mode, graphics-oriented GPU processes avoid aggressive
+memory migration and mainly have their CPU affinity adjusted unless
+\fIalways\fP is selected.
 .TP
 \fB\-\-gpu-migrate-busy-max\fR=\fIPCT\fP
-Upper GPU busy threshold for automatic memory migration in \fIauto\fP mode.
+Upper GPU busy threshold for automatic memory migration in \fIauto\fR mode
+(default 20).  A busy workload is left alone; migration is retried on the next
+cooldown window.
 .TP
 \fB\-\-gpu-graphics-placement\fR=\fIauto|prefer|strict\fP
 Select how strongly numad keeps graphics-oriented GPU workloads on the NUMA node
-nearest the active GPU.  \fIauto\fP preserves the historical behavior of trying
-GPU-local nodes first and then widening to generic NUMA placement when needed,
-while still keeping at least one GPU-local NUMA node in the final target set.
-\fIprefer\fP makes that soft preference explicit for graphics workloads and keeps
-the same GPU-local safety guarantee during fallback.
-\fIstrict\fP disables fallback outside GPU-local nodes when valid GPU-local
-NUMA topology was discovered for the graphics workload.
+nearest the active GPU (default \fIauto\fP).  \fIauto\fP preserves the historical
+behavior of trying GPU-local nodes first and then widening to generic NUMA
+placement when needed, while still keeping at least one GPU-local NUMA node in
+the final target set.  \fIprefer\fP makes that soft preference explicit for
+graphics workloads and keeps the same GPU-local safety guarantee during
+fallback; it selects the same node sets as \fIauto\fP.  \fIstrict\fP disables
+fallback outside GPU-local nodes when valid GPU-local NUMA topology was
+discovered for the graphics workload.
 .TP
 \fB\-\-scx-mode\fR=\fIlegacy|cooperate|observe\fP
-Select how numad cooperates with sched_ext.  In cooperate mode, numad narrows
-the allowed CPU mask and leaves in-domain CPU choice to the active scheduler.
-In observe mode, numad only logs what it would have changed.
+Select how numad cooperates with sched_ext (default \fIcooperate\fP).  In
+cooperate mode, numad narrows the allowed CPU mask and leaves in-domain CPU
+choice to the active scheduler.  In observe mode, numad only logs what it would
+have changed (dry run).  \fIlegacy\fP and \fIcooperate\fP currently behave the
+same.
 .TP
 \fB\-\-scx-sched\fR=\fIauto|beerland|p2dq\fP
-Optional advisory hint for the expected sched_ext scheduler profile.
+Optional advisory hint for the expected sched_ext scheduler profile (default
+\fIauto\fP).
 .TP
 \fB\-\-bind-cooldown\fR=\fISECONDS\fP
-Minimum delay between repeated rebinding attempts for the same process.
+Minimum delay between repeated rebinding attempts for the same process
+(default 300).
 .LP
 The GPU/SCX long options, including \fB\-\-gpu-graphics-placement\fR, and
 \fB\-\-bind-cooldown\fR are startup-only.  When a
@@ -276,6 +288,80 @@ requires the workload to satisfy \fB\-\-gpu-min-busy\fR or
 \fB\-\-gpu-min-vram\fR unless the PID was explicitly included.  When valid
 GPU-local NUMA topology is known, generic fallback preserves at least one
 GPU-local NUMA node in the final target set.
+.LP
+GPU topology is discovered from \fI/sys/class/drm\fP (AMD vendor only) and
+refreshed every 60 seconds.  The fdinfo collector performs a full /proc scan
+every \fB\-\-gpu-fdinfo-discovery\fP seconds (and honors \fB\-S 0\fP, scanning
+only the explicit inclusion list when that mode is selected).  The parser
+understands both the legacy \fIdrm-memory-vram:\fP key and the modern
+\fIdrm-resident-vram:\fP / \fIdrm-total-vram:\fP keys (the legacy key wins;
+otherwise the resident set is preferred over the total).  Engine lines are
+classified by family: \fIcompute\fP/\fIgfx\fP count as compute,
+\fIsdma\fP/\fIdma\fP/copy engines count as neither, and everything else
+(vcn, uvd, vce, jpeg, ...) counts as graphics.
+.LP
+GPU-active processes normally have their CPU affinity narrowed to the
+GPU-local CPUs.  This narrowing is applied only while the process's memory
+target is contained within the GPU-local nodes: a big-memory process whose
+working set spans several nodes keeps the full node-derived CPU mask so its
+threads can spread across every target node.
+.SH "PLACEMENT STABILITY"
+.LP
+numad avoids constant rebinding.  After a process has been placed, the
+following guards apply:
+.TP
+\(bu
+\fBBind cooldown\fR: a process is not re-evaluated for
+\fB\-\-bind-cooldown\fR seconds (default 300) after a bind, a suppressed move,
+or a locality refresh.
+.TP
+\(bu
+\fBAnti-ping-pong\fR: returning to the node set the process was moved from is
+suppressed while the cooldown is active.
+.TP
+\(bu
+\fBHysteresis\fR: a move must improve memory locality by at least 10% to be
+applied.
+.TP
+\(bu
+\fBHeadroom check\fR: if the current nodes still satisfy the requested CPU and
+memory, the process stays put.
+.TP
+\(bu
+\fBAlready-localized check\fR: if at least \fB\-m\fR (default 90%) of the
+process's memory is on the target nodes and the target equals the current
+binding, no rebind happens.
+.TP
+\(bu
+\fBDrift repair\fR: if the process's affinity drifted from the last successful
+target, numad re-applies that target even during the cooldown.
+.LP
+Failed \fImigrate_pages\fR attempts (EINVAL/EFAULT/EPERM/...) abort only the
+memory migration, not the affinity update: the applied affinity is credited
+with a fresh bind timestamp (so the process gets the cooldown and is not
+re-evaluated every cycle), the reason is logged, and migration is retried after
+the cooldown.  A process that actually died during migration is detected by
+the /proc liveness check.
+.SH "MESSAGE QUEUE AND CLIENT MODEL"
+.LP
+Subsequent numad invocations communicate with a running daemon through a SysV
+message queue (key 0xaddaadda):
+.TP
+\(bu
+the queue is created with \fI0600 | IPC_CREAT | IPC_EXCL\fP;
+.TP
+\(bu
+if the queue already exists, the daemon verifies ownership (uid and cuid must
+match its euid) and tightens any group/other permissions left over from older
+versions;
+.TP
+\(bu
+clients must therefore run as the same user as the daemon (root under the
+packaged systemd service).
+.LP
+This prevents an unprivileged user from pre-creating the well-known key and
+injecting commands (e.g. \fB\-p\fP, \fB\-x\fP, \fB\-i\fP including the shutdown
+request) into the root daemon.
 .SH "SCHED_EXT COMPATIBILITY"
 .LP
 numad never starts or stops a sched_ext scheduler automatically.  numad only
@@ -304,9 +390,11 @@ remains experimental and is not the primary recommendation here.
 .LP
 \fI/usr/bin/numad\fP
 .br
-\fI/usr/libexec/numad-wrapper\fP
+\fI/usr/lib/numad/numad-wrapper\fP
 .br
 \fI/etc/numad.conf\fP
+.br
+\fI/etc/logrotate.d/numad\fP
 .br
 \fI/var/log/numad.log\fP
 .br
@@ -329,6 +417,10 @@ Subsequent numad invocations while the daemon is running can be used to dynamica
 You can terminate numad from running by typing:
 .LP
 /usr/bin/numad -i0
+.LP
+or, equivalently, while the daemon is running:
+.LP
+/usr/bin/numad -i 0:0
 .SH "AUTHORS"
 .LP
 Bill Gray <bgray@redhat.com>
